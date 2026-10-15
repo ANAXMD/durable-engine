@@ -37,7 +37,7 @@ type Event struct {
 }
 
 // SaveEvent appends a new state change to the ledger.
-// Notice there is absolutely no UPDATE statement here.
+// Notice there is absolutely no UPDATE statement here — events are immutable.
 func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []byte, seqNum int) error {
 	const query = `
 		INSERT INTO workflow_events (workflow_id, event_type, event_name, input_data, output_data, sequence_number)
@@ -98,16 +98,35 @@ func (d *DB) CreateWorkflow(workflowID, wfType string) error {
 	return nil
 }
 
-// GetPendingWorkflows fetches up to N workflow IDs that are waiting to be processed.
+// GetPendingWorkflows atomically claims up to `limit` PENDING workflows by
+// transitioning them to RUNNING in a single statement.
+//
+// Using FOR UPDATE SKIP LOCKED is the correct pattern for building a
+// distributed work queue on top of Postgres. Without it, two worker processes
+// running concurrently would race and both claim the same row, causing a
+// workflow to be executed twice — a catastrophic bug in a payment system.
+//
+// SKIP LOCKED means: "if another transaction has already locked this row,
+// don't wait — just skip it and return the next available row." This gives us
+// a safe, high-throughput queue with zero blocking.
 func (d *DB) GetPendingWorkflows(limit int) ([]string, error) {
+	// The entire SELECT + UPDATE + RETURNING runs atomically in one round-trip.
+	// No explicit transaction wrapper is needed because a single SQL statement
+	// in Postgres is always implicitly atomic.
 	const query = `
-		SELECT id FROM workflows 
-		WHERE status = 'PENDING' 
-		LIMIT $1
+		UPDATE workflows
+		SET status = 'RUNNING'
+		WHERE id IN (
+			SELECT id FROM workflows
+			WHERE status = 'PENDING'
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id
 	`
 	rows, err := d.sqlDB.Query(query, limit)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query pending workflows: %w", err)
+		return nil, fmt.Errorf("failed to claim pending workflows: %w", err)
 	}
 	defer rows.Close()
 
@@ -115,16 +134,21 @@ func (d *DB) GetPendingWorkflows(limit int) ([]string, error) {
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to scan workflow id: %w", err)
 		}
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
 }
 
-// UpdateWorkflowStatus transitions the aggregate state once the engine finishes.
+// UpdateWorkflowStatus transitions the aggregate state of a workflow.
+// This is the only UPDATE allowed by our event-sourcing rules — it updates
+// the aggregate view (workflows table), not the event ledger (workflow_events).
 func (d *DB) UpdateWorkflowStatus(workflowID, status string) error {
 	const query = `UPDATE workflows SET status = $1 WHERE id = $2`
 	_, err := d.sqlDB.Exec(query, status, workflowID)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to update workflow %s to %s: %w", workflowID, status, err)
+	}
+	return nil
 }

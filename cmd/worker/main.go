@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,9 +20,31 @@ import (
 
 // --- 1. THE ACTUAL WORKFLOW AND ACTIVITIES ---
 
+// MyOrderWorkflow is the orchestrator. It demonstrates two activities and a
+// durable sleep. The sleep will pause the workflow on first run and resume
+// it on the next worker poll (simulating a real timer / delay).
 func MyOrderWorkflow(ctx engine.WorkflowContext) {
-	ctx.ExecuteActivity("ChargeCreditCard", 100)
-	ctx.ExecuteActivity("SendWelcomeEmail", "user@example.com")
+	// Use typed result pointers for strict type safety across replay boundaries.
+	var txID string
+	if err := ctx.ExecuteActivity("ChargeCreditCard", 100, &txID); err != nil {
+		log.Printf("❌ ChargeCreditCard failed: %v", err)
+		return
+	}
+	fmt.Printf("   💰 Transaction ID: %s\n", txID)
+
+	// Durable sleep: the workflow will yield here on first run and resume
+	// on re-execution after the sleep event is already in the ledger.
+	if err := ctx.Sleep("wait-before-email", 5*time.Second); err != nil {
+		log.Printf("❌ Sleep failed: %v", err)
+		return
+	}
+
+	var emailResult string
+	if err := ctx.ExecuteActivity("SendWelcomeEmail", "user@example.com", &emailResult); err != nil {
+		log.Printf("❌ SendWelcomeEmail failed: %v", err)
+		return
+	}
+	fmt.Printf("   📬 Email result: %s\n", emailResult)
 }
 
 func ChargeActivity(ctx context.Context, input any) (any, error) {
@@ -60,7 +83,7 @@ func main() {
 	}
 	defer db.Close()
 
-	// Initialize the Registry and link the strings to our real functions
+	// Initialize the Registry and link strings to our real functions.
 	reg := registry.NewRegistry()
 	reg.RegisterWorkflow("MyOrderWorkflow", MyOrderWorkflow)
 	reg.RegisterActivity("ChargeCreditCard", ChargeActivity)
@@ -83,7 +106,7 @@ func main() {
 		}
 	}()
 
-	// Pass the registry into the worker loop
+	// Pass the registry into the worker loop so it can trigger engine.Run().
 	go runWorkerLoop(shutdown, done, db, reg)
 
 	<-sigCh
@@ -100,9 +123,16 @@ func main() {
 
 func makeCreateWorkflowHandler(db *persistence.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, _ := newUUID()
-		// Create the workflow targeting our real MyOrderWorkflow
-		db.CreateWorkflow(id, "MyOrderWorkflow")
+		id, err := newUUID()
+		if err != nil {
+			http.Error(w, `{"error":"failed to generate id"}`, http.StatusInternalServerError)
+			return
+		}
+		if err := db.CreateWorkflow(id, "MyOrderWorkflow"); err != nil {
+			log.Printf("Error creating workflow: %v", err)
+			http.Error(w, `{"error":"failed to create workflow"}`, http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{"workflow_id": id})
@@ -114,24 +144,57 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	fmt.Println("🔄 Worker loop running...")
+
 	for {
 		select {
 		case <-shutdown:
+			fmt.Println("🔄 Worker loop: shutdown signal received. Stopping.")
 			return
+
 		case <-ticker.C:
+			// GetPendingWorkflows now atomically claims rows with FOR UPDATE SKIP LOCKED,
+			// so concurrent workers will never pick up the same workflow twice.
 			workflows, err := db.GetPendingWorkflows(5)
-			if err != nil || len(workflows) == 0 {
+			if err != nil {
+				log.Printf("❌ Error polling workflows: %v", err)
+				continue
+			}
+			if len(workflows) == 0 {
+				fmt.Println("🔍 Polling for workflows...")
 				continue
 			}
 
 			for _, wfID := range workflows {
-				fmt.Printf("\n🚀 Claimed Pending Workflow: %s\n", wfID)
+				fmt.Printf("\n🚀 Claimed Workflow: %s\n", wfID)
 
-				// Hand the execution over to the Brain
-				engine.Run(wfID, "MyOrderWorkflow", reg, db)
+				runErr := engine.Run(wfID, "MyOrderWorkflow", reg, db)
 
-				db.UpdateWorkflowStatus(wfID, "COMPLETED")
-				fmt.Printf("✅ Workflow %s marked COMPLETED.\n", wfID)
+				switch {
+				case runErr == nil:
+					// Workflow completed all steps cleanly.
+					if err := db.UpdateWorkflowStatus(wfID, "COMPLETED"); err != nil {
+						log.Printf("⚠️  Failed to mark %s COMPLETED: %v", wfID, err)
+					} else {
+						fmt.Printf("✅ Workflow %s marked COMPLETED.\n", wfID)
+					}
+
+				case errors.Is(runErr, engine.ErrYield):
+					fmt.Printf("⏸️  Workflow %s is sleeping — leaving as RUNNING.\n", wfID)
+
+					// --- SCHEDULER HACK: Simulate a Timer Queue waking it up ---
+					go func(id string) {
+						time.Sleep(5 * time.Second)
+						db.UpdateWorkflowStatus(id, "PENDING")
+					}(wfID)
+
+				default:
+					// Unexpected error — mark as FAILED so it doesn't re-run.
+					log.Printf("❌ Workflow %s failed: %v", wfID, runErr)
+					if err := db.UpdateWorkflowStatus(wfID, "FAILED"); err != nil {
+						log.Printf("⚠️  Failed to mark %s FAILED: %v", wfID, err)
+					}
+				}
 			}
 		}
 	}
