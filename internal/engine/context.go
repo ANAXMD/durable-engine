@@ -38,6 +38,7 @@ type WorkflowContext interface {
 	// On subsequent encounters (replay after re-schedule), it returns nil
 	// immediately, allowing execution to continue past the sleep point.
 	Sleep(sleepName string, d time.Duration) error
+	Now() (time.Time, error)
 }
 
 type engineContext struct {
@@ -186,4 +187,40 @@ func (c *engineContext) Sleep(sleepName string, d time.Duration) error {
 	// Panic with the sentinel value. Run()'s defer/recover will catch this,
 	// distinguish it from a real crash, and return ErrYield to the worker.
 	panic(yieldPanic)
+}
+
+// Now safely returns the current time in a deterministic way.
+// On the first run, it generates time.Now() and saves it to the ledger.
+// On replays, it fetches the exact same timestamp from the ledger so
+// the workflow logic never changes between crashes.
+func (c *engineContext) Now() (time.Time, error) {
+	c.sequenceNumber++
+
+	// 1. Replay Phase: Did we already check the time in a previous run?
+	event, err := c.db.GetEvent(c.workflowID, c.sequenceNumber)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to check event history for Now(): %w", err)
+	}
+
+	if event != nil {
+		log.Printf("⏪ [REPLAY]   Now() (Seq %d) — returning saved timestamp.", c.sequenceNumber)
+		var savedTime time.Time
+		if err := json.Unmarshal(event.OutputData, &savedTime); err != nil {
+			return time.Time{}, fmt.Errorf("failed to unmarshal time: %w", err)
+		}
+		return savedTime, nil
+	}
+
+	// 2. Execution Phase: Generate the real time and save it.
+	log.Printf("⏱️  [SIDE EFFECT] Now() (Seq %d) — generating new timestamp.", c.sequenceNumber)
+	currentTime := time.Now()
+
+	timeBytes, _ := json.Marshal(currentTime)
+
+	// Save it as a "SIDE_EFFECT" event. Input is empty because it takes no arguments.
+	if err := c.db.SaveEvent(c.workflowID, "SIDE_EFFECT", "TimeNow", []byte("{}"), timeBytes, c.sequenceNumber); err != nil {
+		return time.Time{}, fmt.Errorf("failed to save time to ledger: %w", err)
+	}
+
+	return currentTime, nil
 }

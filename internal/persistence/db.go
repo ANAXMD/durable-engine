@@ -152,3 +152,10 @@ func (d *DB) UpdateWorkflowStatus(workflowID, status string) error {
 	}
 	return nil
 }
+
+// ResetStuckWorkflows is run on boot to recover jobs from workers that crashed.
+func (d *DB) ResetStuckWorkflows() error {
+	const query = `UPDATE workflows SET status = 'PENDING' WHERE status = 'RUNNING'`
+	_, err := d.sqlDB.Exec(query)
+	return err
+}

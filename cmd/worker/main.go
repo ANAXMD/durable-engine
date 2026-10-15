@@ -24,6 +24,9 @@ import (
 // durable sleep. The sleep will pause the workflow on first run and resume
 // it on the next worker poll (simulating a real timer / delay).
 func MyOrderWorkflow(ctx engine.WorkflowContext) {
+	//Deterministic Time Check
+	startedAt, _ := ctx.Now()
+	fmt.Printf("   ⏰ Workflow started at: %s\n", startedAt.Format(time.Kitchen))
 	// Use typed result pointers for strict type safety across replay boundaries.
 	var txID string
 	if err := ctx.ExecuteActivity("ChargeCreditCard", 100, &txID); err != nil {
@@ -105,6 +108,9 @@ func main() {
 			log.Fatalf("Fatal: HTTP server error: %v", err)
 		}
 	}()
+
+	fmt.Println("🧹 Sweeping stuck workflows back to PENDING...")
+	db.ResetStuckWorkflows()
 
 	// Pass the registry into the worker loop so it can trigger engine.Run().
 	go runWorkerLoop(shutdown, done, db, reg)
