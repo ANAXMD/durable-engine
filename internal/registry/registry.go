@@ -6,7 +6,11 @@ import (
 	"reflect"
 )
 
-type ActivityFunc func(ctx context.Context, input any) (any, error)
+// ActivityFunc defines the standard signature for any activity the engine runs.
+// The idempotencyKey is a stable, unique string derived from the workflow ID and
+// sequence number. Activities that call external APIs (Stripe, SendGrid, etc.)
+// should pass this key to their provider to prevent double-charging on retries.
+type ActivityFunc func(ctx context.Context, idempotencyKey string, input any) (any, error)
 
 type Registry struct {
 	workflows  map[string]reflect.Value

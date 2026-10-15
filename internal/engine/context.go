@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"reflect"
@@ -12,17 +11,6 @@ import (
 	"durable-engine/internal/persistence"
 	"durable-engine/internal/registry"
 )
-
-// ErrYield is returned by Run when a workflow pauses itself via Sleep().
-// The worker must keep the workflow status as RUNNING and revisit it on the
-// next poll tick, at which point the sleep event will be replayed and the
-// workflow will resume from where it paused.
-var ErrYield = errors.New("workflow yielded: sleep not yet elapsed")
-
-// yieldPanic is the sentinel value thrown via panic() inside Sleep() and
-// caught by the defer/recover in Run(). We use a typed string constant rather
-// than a plain string to avoid accidental collisions with other panics.
-const yieldPanic = "YIELD_SLEEP"
 
 // WorkflowContext is the interface injected into every workflow function.
 // Using resultPtr any (instead of a generic) keeps the interface compatible
@@ -33,12 +21,29 @@ type WorkflowContext interface {
 	// first execution, it runs the real code, saves it, then unmarshals.
 	ExecuteActivity(name string, input any, resultPtr any) error
 
-	// Sleep pauses the workflow durably. On the first encounter it saves a
-	// SLEEP_START event and panics with yieldPanic to unwind the goroutine.
-	// On subsequent encounters (replay after re-schedule), it returns nil
-	// immediately, allowing execution to continue past the sleep point.
+	// Sleep pauses the workflow durably. On first encounter it saves the
+	// absolute wake-up time and panics with a YieldError. On re-execution,
+	// if the wake time has not elapsed it panics again; if it has, it returns
+	// nil and execution continues.
 	Sleep(sleepName string, d time.Duration) error
+
+	// Now returns the current time deterministically. The first call saves the
+	// timestamp to the ledger; all replays return the exact same saved value.
 	Now() (time.Time, error)
+}
+
+// YieldError is panicked by Sleep() and caught by Run(). It carries the
+// absolute time the workflow wants to be woken at so the worker can persist
+// it to the database via SleepWorkflow().
+//
+// It is a struct (not a plain error value) so errors.As() can extract WakeAt
+// from within an arbitrary error wrapping chain.
+type YieldError struct {
+	WakeAt time.Time
+}
+
+func (y YieldError) Error() string {
+	return fmt.Sprintf("workflow yielded: sleeping until %s", y.WakeAt.Format(time.RFC3339))
 }
 
 type engineContext struct {
@@ -49,9 +54,14 @@ type engineContext struct {
 }
 
 // Run is the entry point that dynamically invokes the workflow function using
-// reflection. It returns ErrYield if the workflow paused itself via Sleep(),
-// or nil on clean completion. Any other panic is logged and swallowed to keep
-// the worker goroutine alive.
+// reflection. Return values:
+//
+//   - nil            — workflow completed all steps cleanly
+//   - YieldError     — workflow called Sleep() and is not yet due to resume
+//   - any other error — workflow panicked or a step returned an error
+//
+// The workflow function is called via reflect so it can be registered by name
+// without the engine having a compile-time dependency on user code.
 func Run(wfID string, wfType string, reg *registry.Registry, db *persistence.DB) (err error) {
 	ctx := &engineContext{
 		workflowID:     wfID,
@@ -62,38 +72,63 @@ func Run(wfID string, wfType string, reg *registry.Registry, db *persistence.DB)
 
 	fn, lookupErr := reg.GetWorkflow(wfType)
 	if lookupErr != nil {
-		return fmt.Errorf("❌ workflow %s not registered: %w", wfType, lookupErr)
+		return fmt.Errorf("workflow %s not registered: %w", wfType, lookupErr)
 	}
 
-	// Intercept panics thrown by Sleep() (yieldPanic) separately from real
-	// crashes. Named return `err` lets us assign inside the deferred closure.
+	// Named return `err` lets the deferred closure assign into it.
 	defer func() {
 		r := recover()
 		if r == nil {
-			// Normal completion — no panic, err stays nil.
+			// fn.Call returned normally — err is whatever was set before defer.
 			return
 		}
-		if r == yieldPanic {
-			// The workflow called Sleep() for the first time.
-			// Signal the caller to leave the status as RUNNING.
-			log.Printf("⏸️  Workflow %s yielded (sleep not yet elapsed).", wfID)
-			err = ErrYield
+
+		// YieldError: the workflow called Sleep() and needs to be re-scheduled.
+		if ye, ok := r.(YieldError); ok {
+			log.Printf("⏸️  Workflow %s yielded until %s.", wfID, ye.WakeAt.Format(time.RFC3339))
+			err = ye // surface to caller for SleepWorkflow()
 			return
 		}
-		// Any other panic is a real bug — log it without crashing the worker.
-		log.Printf("⚠️  Workflow %s panicked unexpectedly: %v", wfID, r)
+
+		// Any other panic is a real bug. Wrap it as an error so the worker can
+		// mark the workflow FAILED rather than silently dropping it.
+		err = fmt.Errorf("workflow %s panicked: %v", wfID, r)
+		log.Printf("⚠️  %v", err)
 	}()
 
 	log.Printf("▶️  Starting workflow %s (type: %s)", wfID, wfType)
 
-	// Dynamically pass the WorkflowContext into the workflow function.
-	fn.Call([]reflect.Value{reflect.ValueOf(ctx)})
+	// Reflect-based dispatch: call fn(ctx WorkflowContext) error
+	// We check the return value so workflow functions can propagate errors.
+	results := fn.Call([]reflect.Value{reflect.ValueOf(ctx)})
+
+	// Workflows that return an error value signal failure via the return channel
+	// rather than panicking — check for a non-nil error in the first return value.
+	if len(results) > 0 && !results[0].IsNil() {
+		return results[0].Interface().(error)
+	}
+
 	return nil
 }
 
-// ExecuteActivity implements the Replay → Execute → Persist cycle.
+// ExecuteActivity implements the Replay → Execute → Persist cycle with
+// idempotency keys and non-determinism detection.
+//
+// Crash safety guarantee:
+//
+//	ACTIVITY_STARTED is written BEFORE the activity runs. If the worker crashes
+//	mid-activity, on the next run GetEvent returns the STARTED event, the engine
+//	detects it has no output (type == ACTIVITY_STARTED), and re-executes the
+//	activity with the same idempotency key — the external API can use that key
+//	to deduplicate the request without charging twice.
 func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) error {
 	c.sequenceNumber++
+
+	// Generate a stable idempotency key from the workflow ID and sequence number.
+	// This key uniquely identifies "this specific step in this specific workflow run"
+	// and is safe to pass to external APIs (Stripe, SendGrid, etc.) as a
+	// deduplication token.
+	idempotencyKey := fmt.Sprintf("%s-%d", c.workflowID, c.sequenceNumber)
 
 	// 1. Replay Phase: look up this sequence position in the event ledger.
 	event, err := c.db.GetEvent(c.workflowID, c.sequenceNumber)
@@ -102,34 +137,59 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 	}
 
 	if event != nil {
-		log.Printf("⏪ [REPLAY]   %s (Seq %d) — deserializing saved output.", name, c.sequenceNumber)
-		// Unmarshal the stored JSON directly into the caller's result pointer.
-		// This guarantees the workflow receives the same typed value on replay
-		// as it did during the original execution.
-		if err := json.Unmarshal(event.OutputData, resultPtr); err != nil {
-			return fmt.Errorf("failed to unmarshal replayed output for %s: %w", name, err)
+		// Non-Determinism Detection: verify the history matches the code.
+		// If the workflow was changed (e.g., a new activity inserted before this
+		// one), the event at this sequence position will have a different name.
+		// Continuing would corrupt history by replaying the wrong activity's
+		// output into the new step — a silent, catastrophic data bug.
+		if event.EventName != name {
+			return fmt.Errorf(
+				"non-deterministic execution detected at Seq %d: expected activity '%s', found '%s' in history — do not reorder or insert workflow steps",
+				c.sequenceNumber, name, event.EventName,
+			)
 		}
-		return nil
+
+		// If the saved event is ACTIVITY_STARTED (crash between start and complete),
+		// fall through to re-execute with the same idempotencyKey.
+		// External APIs that received the key will deduplicate; local state is safe.
+		if event.EventType == "ACTIVITY_COMPLETED" {
+			log.Printf("⏪ [REPLAY]   %s (Seq %d) — deserializing saved output.", name, c.sequenceNumber)
+			if err := json.Unmarshal(event.OutputData, resultPtr); err != nil {
+				return fmt.Errorf("failed to unmarshal replayed output for %s: %w", name, err)
+			}
+			return nil
+		}
+
+		log.Printf("🔁 [RETRY]    %s (Seq %d) — found STARTED but no COMPLETED, re-executing with same idempotency key.", name, c.sequenceNumber)
 	}
 
-	// 2. Execution Phase: activity has never run — call the real code.
-	log.Printf("⚙️  [EXECUTE]  %s (Seq %d) — running activity...", name, c.sequenceNumber)
+	// 2. Intent Recording: save ACTIVITY_STARTED BEFORE calling the real code.
+	// This closes the crash window: if we crash between STARTED and COMPLETED,
+	// the next run will find this event and retry with the same idempotencyKey.
+	// ON CONFLICT DO NOTHING in SaveEvent makes this safe to re-run on retry.
+	inputBytes, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("failed to marshal input for %s: %w", name, err)
+	}
+	if err := c.db.SaveEvent(c.workflowID, "ACTIVITY_STARTED", name, inputBytes, []byte("{}"), c.sequenceNumber); err != nil {
+		return fmt.Errorf("failed to save ACTIVITY_STARTED for %s: %w", name, err)
+	}
+
+	// 3. Execution Phase: call the real activity code with the idempotency key.
+	log.Printf("⚙️  [EXECUTE]  %s (Seq %d, key: %s) — running activity...", name, c.sequenceNumber, idempotencyKey)
 
 	actFn, err := c.registry.GetActivity(name)
 	if err != nil {
 		return fmt.Errorf("activity %s not registered: %w", name, err)
 	}
 
-	rawResult, err := actFn(context.Background(), input)
+	rawResult, err := actFn(context.Background(), idempotencyKey, input)
 	if err != nil {
 		return fmt.Errorf("activity %s failed: %w", name, err)
 	}
 
-	// 3. Type-Safety Round-Trip: marshal then unmarshal into resultPtr.
-	// This ensures that what the workflow sees is the exact same type it
-	// would see on a replay — preventing subtle bugs where a live result
-	// has a concrete Go type (e.g. string) but a replayed one would be
-	// json.RawMessage if we skipped this step.
+	// 4. Type-Safety Round-Trip: marshal → unmarshal into resultPtr.
+	// Ensures live execution and replay produce identically-typed values.
 	outputBytes, err := json.Marshal(rawResult)
 	if err != nil {
 		return fmt.Errorf("failed to marshal output for %s: %w", name, err)
@@ -138,13 +198,11 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 		return fmt.Errorf("failed to unmarshal output into resultPtr for %s: %w", name, err)
 	}
 
-	// 4. Event Sourcing Phase: persist to the immutable ledger.
-	inputBytes, err := json.Marshal(input)
-	if err != nil {
-		return fmt.Errorf("failed to marshal input for %s: %w", name, err)
-	}
+	// 5. Event Sourcing Phase: persist ACTIVITY_COMPLETED to the immutable ledger.
+	// ON CONFLICT DO NOTHING here means: if we somehow write COMPLETED twice
+	// (e.g., network timeout then retry), the second write is a harmless no-op.
 	if err := c.db.SaveEvent(c.workflowID, "ACTIVITY_COMPLETED", name, inputBytes, outputBytes, c.sequenceNumber); err != nil {
-		return fmt.Errorf("failed to save event for %s: %w", name, err)
+		return fmt.Errorf("failed to save ACTIVITY_COMPLETED for %s: %w", name, err)
 	}
 
 	return nil
@@ -152,41 +210,58 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 
 // Sleep implements a durable pause.
 //
-// First encounter: saves a SLEEP_START event to the ledger to record when the
-// sleep was requested, then panics with yieldPanic to unwind the goroutine.
-// The deferred recover() in Run() catches this and returns ErrYield.
+// First encounter: calculate wakeAt = now + d, save a SLEEP_START event
+// containing wakeAt, then panic(YieldError{WakeAt: wakeAt}). The deferred
+// recover() in Run() catches YieldError and returns it to the worker, which
+// calls db.SleepWorkflow(wakeAt) and exits the tick.
 //
-// Subsequent encounters (workflow re-runs after re-scheduling): the SLEEP_START
-// event already exists in the ledger so we return nil immediately, letting the
-// workflow code continue past this point. The caller is responsible for
-// re-queuing the workflow after the duration has elapsed (a future scheduler).
+// Re-execution after the timer fires: the SLEEP_START event is in the ledger.
+// Unmarshal wakeAt from it. If time.Now().Before(wakeAt), the timer hasn't
+// elapsed — panic again so the worker re-sleeps without advancing state. If
+// it has elapsed, return nil and let the workflow continue.
+//
+// This design means Sleep() is both durable (survives crashes) and correct
+// under replay — the workflow never "forgets" how long it was supposed to sleep.
 func (c *engineContext) Sleep(sleepName string, d time.Duration) error {
 	c.sequenceNumber++
 
-	// Check if this sleep was already recorded in the ledger.
 	event, err := c.db.GetEvent(c.workflowID, c.sequenceNumber)
 	if err != nil {
 		return fmt.Errorf("failed to check sleep event: %w", err)
 	}
 
 	if event != nil {
-		// Sleep was already recorded — the workflow is resuming past this point.
-		log.Printf("⏩ [RESUME]   Sleep '%s' (Seq %d) — already elapsed, continuing.", sleepName, c.sequenceNumber)
+		// The sleep was already saved — unmarshal the target wake time.
+		var wakeAt time.Time
+		if err := json.Unmarshal(event.OutputData, &wakeAt); err != nil {
+			return fmt.Errorf("failed to unmarshal wakeAt for sleep '%s': %w", sleepName, err)
+		}
+
+		if time.Now().Before(wakeAt) {
+			// Timer hasn't elapsed. Re-yield so the worker re-sleeps.
+			log.Printf("💤 [SLEEP]    '%s' (Seq %d) — not yet elapsed (wakes at %s).", sleepName, c.sequenceNumber, wakeAt.Format(time.RFC3339))
+			panic(YieldError{WakeAt: wakeAt})
+		}
+
+		// Timer has elapsed — the workflow resumes normally.
+		log.Printf("⏩ [RESUME]   Sleep '%s' (Seq %d) — elapsed, continuing.", sleepName, c.sequenceNumber)
 		return nil
 	}
 
-	// First time we hit this sleep: record the start time in the ledger so
-	// that on the next run we know when the sleep was requested.
+	// First encounter: calculate and save the absolute wake time.
+	wakeAt := time.Now().Add(d)
+	wakeBytes, err := json.Marshal(wakeAt)
+	if err != nil {
+		return fmt.Errorf("failed to marshal wakeAt for sleep '%s': %w", sleepName, err)
+	}
+
 	durationBytes, _ := json.Marshal(d.String())
-	if err := c.db.SaveEvent(c.workflowID, "SLEEP_START", sleepName, durationBytes, durationBytes, c.sequenceNumber); err != nil {
+	if err := c.db.SaveEvent(c.workflowID, "SLEEP_START", sleepName, durationBytes, wakeBytes, c.sequenceNumber); err != nil {
 		return fmt.Errorf("failed to save sleep event: %w", err)
 	}
 
-	log.Printf("💤 [SLEEP]    '%s' (Seq %d) — yielding for %s.", sleepName, c.sequenceNumber, d)
-
-	// Panic with the sentinel value. Run()'s defer/recover will catch this,
-	// distinguish it from a real crash, and return ErrYield to the worker.
-	panic(yieldPanic)
+	log.Printf("💤 [SLEEP]    '%s' (Seq %d) — yielding until %s.", sleepName, c.sequenceNumber, wakeAt.Format(time.RFC3339))
+	panic(YieldError{WakeAt: wakeAt})
 }
 
 // Now safely returns the current time in a deterministic way.
@@ -196,7 +271,6 @@ func (c *engineContext) Sleep(sleepName string, d time.Duration) error {
 func (c *engineContext) Now() (time.Time, error) {
 	c.sequenceNumber++
 
-	// 1. Replay Phase: Did we already check the time in a previous run?
 	event, err := c.db.GetEvent(c.workflowID, c.sequenceNumber)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to check event history for Now(): %w", err)
@@ -211,13 +285,10 @@ func (c *engineContext) Now() (time.Time, error) {
 		return savedTime, nil
 	}
 
-	// 2. Execution Phase: Generate the real time and save it.
 	log.Printf("⏱️  [SIDE EFFECT] Now() (Seq %d) — generating new timestamp.", c.sequenceNumber)
 	currentTime := time.Now()
 
 	timeBytes, _ := json.Marshal(currentTime)
-
-	// Save it as a "SIDE_EFFECT" event. Input is empty because it takes no arguments.
 	if err := c.db.SaveEvent(c.workflowID, "SIDE_EFFECT", "TimeNow", []byte("{}"), timeBytes, c.sequenceNumber); err != nil {
 		return time.Time{}, fmt.Errorf("failed to save time to ledger: %w", err)
 	}

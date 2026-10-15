@@ -20,47 +20,50 @@ import (
 
 // --- 1. THE ACTUAL WORKFLOW AND ACTIVITIES ---
 
-// MyOrderWorkflow is the orchestrator. It demonstrates two activities and a
-// durable sleep. The sleep will pause the workflow on first run and resume
-// it on the next worker poll (simulating a real timer / delay).
-func MyOrderWorkflow(ctx engine.WorkflowContext) {
-	//Deterministic Time Check
-	startedAt, _ := ctx.Now()
+// MyOrderWorkflow is the orchestrator. It now returns an error so that
+// failures propagate cleanly back to the worker loop instead of being
+// silently dropped via a bare `return`.
+func MyOrderWorkflow(ctx engine.WorkflowContext) error {
+	// Deterministic time: saved to the ledger on first run, replayed on restart.
+	startedAt, err := ctx.Now()
+	if err != nil {
+		return fmt.Errorf("now: %w", err)
+	}
 	fmt.Printf("   ⏰ Workflow started at: %s\n", startedAt.Format(time.Kitchen))
-	// Use typed result pointers for strict type safety across replay boundaries.
+
+	// Type-safe result pointer: same value on first run and replay.
 	var txID string
 	if err := ctx.ExecuteActivity("ChargeCreditCard", 100, &txID); err != nil {
-		log.Printf("❌ ChargeCreditCard failed: %v", err)
-		return
+		return fmt.Errorf("ChargeCreditCard: %w", err)
 	}
 	fmt.Printf("   💰 Transaction ID: %s\n", txID)
 
-	// Durable sleep: the workflow will yield here on first run and resume
-	// on re-execution after the sleep event is already in the ledger.
+	// Durable sleep: yields on first run; resumes transparently after timer fires.
 	if err := ctx.Sleep("wait-before-email", 5*time.Second); err != nil {
-		log.Printf("❌ Sleep failed: %v", err)
-		return
+		return fmt.Errorf("sleep: %w", err)
 	}
 
 	var emailResult string
 	if err := ctx.ExecuteActivity("SendWelcomeEmail", "user@example.com", &emailResult); err != nil {
-		log.Printf("❌ SendWelcomeEmail failed: %v", err)
-		return
+		return fmt.Errorf("SendWelcomeEmail: %w", err)
 	}
 	fmt.Printf("   📬 Email result: %s\n", emailResult)
+
+	return nil
 }
 
-func ChargeActivity(ctx context.Context, input any) (any, error) {
-	// Simulate talking to Stripe
-	fmt.Printf("   💳 [STRIPE API] Charging credit card...\n")
-	time.Sleep(2 * time.Second) // Simulate network delay
+func ChargeActivity(ctx context.Context, idempotencyKey string, input any) (any, error) {
+	// In production: pass idempotencyKey to Stripe as the Idempotency-Key header
+	// so a crash-then-retry never charges the customer twice.
+	fmt.Printf("   💳 [STRIPE API] Charging (key: %s)...\n", idempotencyKey)
+	time.Sleep(2 * time.Second) // Simulate network latency
 	return "tx_12345", nil
 }
 
-func EmailActivity(ctx context.Context, input any) (any, error) {
-	// Simulate talking to SendGrid
-	fmt.Printf("   📧 [SENDGRID API] Sending welcome email...\n")
-	time.Sleep(2 * time.Second) // Simulate network delay
+func EmailActivity(ctx context.Context, idempotencyKey string, input any) (any, error) {
+	// In production: pass idempotencyKey to SendGrid to prevent duplicate emails.
+	fmt.Printf("   📧 [SENDGRID API] Sending email (key: %s)...\n", idempotencyKey)
+	time.Sleep(2 * time.Second) // Simulate network latency
 	return "email_sent", nil
 }
 
@@ -109,10 +112,10 @@ func main() {
 		}
 	}()
 
-	fmt.Println("🧹 Sweeping stuck workflows back to PENDING...")
-	db.ResetStuckWorkflows()
-
 	// Pass the registry into the worker loop so it can trigger engine.Run().
+	// NOTE: ResetStuckWorkflows() has been intentionally removed. Lease expiry
+	// handles zombie recovery automatically — a boot-time reset would wrongly
+	// re-queue workflows actively held by other workers in a multi-process setup.
 	go runWorkerLoop(shutdown, done, db, reg)
 
 	<-sigCh
@@ -147,10 +150,15 @@ func makeCreateWorkflowHandler(db *persistence.DB) http.HandlerFunc {
 
 func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persistence.DB, reg *registry.Registry) {
 	defer close(done)
+
+	// workerID uniquely identifies this process instance. Using PID is a simple
+	// approach that works well for single-host deployments. In Kubernetes, you
+	// would use the pod name or a UUID generated at startup.
+	workerID := fmt.Sprintf("worker-%d", os.Getpid())
+	fmt.Printf("🔄 Worker loop running (ID: %s)...\n", workerID)
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
-	fmt.Println("🔄 Worker loop running...")
 
 	for {
 		select {
@@ -159,9 +167,9 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 			return
 
 		case <-ticker.C:
-			// GetPendingWorkflows now atomically claims rows with FOR UPDATE SKIP LOCKED,
-			// so concurrent workers will never pick up the same workflow twice.
-			workflows, err := db.GetPendingWorkflows(5)
+			// GetPendingWorkflows claims rows atomically with FOR UPDATE SKIP LOCKED.
+			// The workerID is stamped onto the lease so only we can finalize the result.
+			workflows, err := db.GetPendingWorkflows(5, workerID)
 			if err != nil {
 				log.Printf("❌ Error polling workflows: %v", err)
 				continue
@@ -176,28 +184,30 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 
 				runErr := engine.Run(wfID, "MyOrderWorkflow", reg, db)
 
+				var yieldErr engine.YieldError
 				switch {
 				case runErr == nil:
-					// Workflow completed all steps cleanly.
-					if err := db.UpdateWorkflowStatus(wfID, "COMPLETED"); err != nil {
+					// All steps completed. Only succeeds if we still own the lease.
+					if err := db.UpdateWorkflowStatus(wfID, "COMPLETED", workerID); err != nil {
 						log.Printf("⚠️  Failed to mark %s COMPLETED: %v", wfID, err)
 					} else {
 						fmt.Printf("✅ Workflow %s marked COMPLETED.\n", wfID)
 					}
 
-				case errors.Is(runErr, engine.ErrYield):
-					fmt.Printf("⏸️  Workflow %s is sleeping — leaving as RUNNING.\n", wfID)
-
-					// --- SCHEDULER HACK: Simulate a Timer Queue waking it up ---
-					go func(id string) {
-						time.Sleep(5 * time.Second)
-						db.UpdateWorkflowStatus(id, "PENDING")
-					}(wfID)
+				case errors.As(runErr, &yieldErr):
+					// The workflow called Sleep(). Transition to SLEEPING state and
+					// record the absolute wake time. The next poll that finds
+					// wake_at <= NOW() will reclaim and resume this workflow.
+					fmt.Printf("⏸️  Workflow %s sleeping until %s.\n", wfID, yieldErr.WakeAt.Format(time.RFC3339))
+					if err := db.SleepWorkflow(wfID, workerID, yieldErr.WakeAt); err != nil {
+						log.Printf("⚠️  Failed to sleep workflow %s: %v", wfID, err)
+					}
 
 				default:
-					// Unexpected error — mark as FAILED so it doesn't re-run.
+					// Real error (panic or activity failure) — mark FAILED so the
+					// workflow doesn't get retried indefinitely.
 					log.Printf("❌ Workflow %s failed: %v", wfID, runErr)
-					if err := db.UpdateWorkflowStatus(wfID, "FAILED"); err != nil {
+					if err := db.UpdateWorkflowStatus(wfID, "FAILED", workerID); err != nil {
 						log.Printf("⚠️  Failed to mark %s FAILED: %v", wfID, err)
 					}
 				}
