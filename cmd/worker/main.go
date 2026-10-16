@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -82,7 +83,11 @@ func newUUID() (string, error) {
 func main() {
 	fmt.Println("⚙️  Booting Durable Engine Worker...")
 
-	dsn := "postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable"
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable"
+	}
+
 	db, err := persistence.ConnectDB(dsn)
 	if err != nil {
 		log.Fatalf("Fatal: Could not connect to database: %v", err)
@@ -112,10 +117,7 @@ func main() {
 		}
 	}()
 
-	// Pass the registry into the worker loop so it can trigger engine.Run().
-	// NOTE: ResetStuckWorkflows() has been intentionally removed. Lease expiry
-	// handles zombie recovery automatically — a boot-time reset would wrongly
-	// re-queue workflows actively held by other workers in a multi-process setup.
+	// Launch worker loop with goroutine pool for concurrent workflow execution
 	go runWorkerLoop(shutdown, done, db, reg)
 
 	<-sigCh
@@ -137,39 +139,63 @@ func makeCreateWorkflowHandler(db *persistence.DB) http.HandlerFunc {
 			http.Error(w, `{"error":"failed to generate id"}`, http.StatusInternalServerError)
 			return
 		}
-		if err := db.CreateWorkflow(id, "MyOrderWorkflow"); err != nil {
+
+		var req struct {
+			WorkflowType string `json:"workflow_type"`
+		}
+		// Allow caller to optionally specify workflow_type, defaulting to MyOrderWorkflow
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		wfType := req.WorkflowType
+		if wfType == "" {
+			wfType = "MyOrderWorkflow"
+		}
+
+		if err := db.CreateWorkflow(id, wfType); err != nil {
 			log.Printf("Error creating workflow: %v", err)
 			http.Error(w, `{"error":"failed to create workflow"}`, http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{"workflow_id": id})
+		json.NewEncoder(w).Encode(map[string]string{
+			"workflow_id":   id,
+			"workflow_type": wfType,
+		})
 	}
 }
+
+const maxConcurrentWorkflows = 5
 
 func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persistence.DB, reg *registry.Registry) {
 	defer close(done)
 
-	// workerID uniquely identifies this process instance. Using PID is a simple
-	// approach that works well for single-host deployments. In Kubernetes, you
-	// would use the pod name or a UUID generated at startup.
 	workerID := fmt.Sprintf("worker-%d", os.Getpid())
 	fmt.Printf("🔄 Worker loop running (ID: %s)...\n", workerID)
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	// Goroutine pool management: bounded concurrency semaphore and in-flight waitgroup.
+	sem := make(chan struct{}, maxConcurrentWorkflows)
+	var activeWg sync.WaitGroup
+
 	for {
 		select {
 		case <-shutdown:
-			fmt.Println("🔄 Worker loop: shutdown signal received. Stopping.")
+			fmt.Println("🔄 Worker loop: shutdown signal received. Waiting for in-flight workflows to complete...")
+			activeWg.Wait()
 			return
 
 		case <-ticker.C:
-			// GetPendingWorkflows claims rows atomically with FOR UPDATE SKIP LOCKED.
-			// The workerID is stamped onto the lease so only we can finalize the result.
-			workflows, err := db.GetPendingWorkflows(5, workerID)
+			// Claim only up to our remaining worker capacity so claimed jobs don't starve on the local queue.
+			availableCapacity := maxConcurrentWorkflows - len(sem)
+			if availableCapacity <= 0 {
+				continue
+			}
+
+			workflows, err := db.GetPendingWorkflows(availableCapacity, workerID)
 			if err != nil {
 				log.Printf("❌ Error polling workflows: %v", err)
 				continue
@@ -179,39 +205,53 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 				continue
 			}
 
-			for _, wfID := range workflows {
-				fmt.Printf("\n🚀 Claimed Workflow: %s\n", wfID)
+			for _, wf := range workflows {
+				sem <- struct{}{}
+				activeWg.Add(1)
 
-				runErr := engine.Run(wfID, "MyOrderWorkflow", reg, db)
+				go func(wfRec persistence.WorkflowRecord) {
+					defer func() {
+						<-sem
+						activeWg.Done()
+					}()
 
-				var yieldErr engine.YieldError
-				switch {
-				case runErr == nil:
-					// All steps completed. Only succeeds if we still own the lease.
-					if err := db.UpdateWorkflowStatus(wfID, "COMPLETED", workerID); err != nil {
-						log.Printf("⚠️  Failed to mark %s COMPLETED: %v", wfID, err)
-					} else {
-						fmt.Printf("✅ Workflow %s marked COMPLETED.\n", wfID)
-					}
-
-				case errors.As(runErr, &yieldErr):
-					// The workflow called Sleep(). Transition to SLEEPING state and
-					// record the absolute wake time. The next poll that finds
-					// wake_at <= NOW() will reclaim and resume this workflow.
-					fmt.Printf("⏸️  Workflow %s sleeping until %s.\n", wfID, yieldErr.WakeAt.Format(time.RFC3339))
-					if err := db.SleepWorkflow(wfID, workerID, yieldErr.WakeAt); err != nil {
-						log.Printf("⚠️  Failed to sleep workflow %s: %v", wfID, err)
-					}
-
-				default:
-					// Real error (panic or activity failure) — mark FAILED so the
-					// workflow doesn't get retried indefinitely.
-					log.Printf("❌ Workflow %s failed: %v", wfID, runErr)
-					if err := db.UpdateWorkflowStatus(wfID, "FAILED", workerID); err != nil {
-						log.Printf("⚠️  Failed to mark %s FAILED: %v", wfID, err)
-					}
-				}
+					processWorkflow(db, reg, wfRec, workerID)
+				}(wf)
 			}
+		}
+	}
+}
+
+func processWorkflow(db *persistence.DB, reg *registry.Registry, wf persistence.WorkflowRecord, workerID string) {
+	fmt.Printf("\n🚀 Claimed Workflow: %s (Type: %s)\n", wf.ID, wf.Type)
+
+	runErr := engine.Run(wf.ID, wf.Type, reg, db)
+
+	var yieldErr engine.YieldError
+	switch {
+	case runErr == nil:
+		// All steps completed. Only succeeds if we still own the lease.
+		if err := db.UpdateWorkflowStatus(wf.ID, "COMPLETED", workerID); err != nil {
+			log.Printf("⚠️  Failed to mark %s COMPLETED: %v", wf.ID, err)
+		} else {
+			fmt.Printf("✅ Workflow %s marked COMPLETED.\n", wf.ID)
+		}
+
+	case errors.As(runErr, &yieldErr):
+		// The workflow called Sleep(). Transition to SLEEPING state and
+		// record the absolute wake time. The next poll that finds
+		// wake_at <= NOW() will reclaim and resume this workflow.
+		fmt.Printf("⏸️  Workflow %s sleeping until %s.\n", wf.ID, yieldErr.WakeAt.Format(time.RFC3339))
+		if err := db.SleepWorkflow(wf.ID, workerID, yieldErr.WakeAt); err != nil {
+			log.Printf("⚠️  Failed to sleep workflow %s: %v", wf.ID, err)
+		}
+
+	default:
+		// Real error (panic or activity failure) — mark FAILED so the
+		// workflow doesn't get retried indefinitely.
+		log.Printf("❌ Workflow %s failed: %v", wf.ID, runErr)
+		if err := db.UpdateWorkflowStatus(wf.ID, "FAILED", workerID); err != nil {
+			log.Printf("⚠️  Failed to mark %s FAILED: %v", wf.ID, err)
 		}
 	}
 }

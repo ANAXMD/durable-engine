@@ -109,6 +109,12 @@ func (d *DB) CreateWorkflow(workflowID, wfType string) error {
 	return nil
 }
 
+// WorkflowRecord represents a claimed workflow header from the database.
+type WorkflowRecord struct {
+	ID   string
+	Type string
+}
+
 // GetPendingWorkflows atomically claims up to `limit` workable jobs and stamps
 // them with a lease owned by workerID. A job is claimable if it is:
 //
@@ -123,7 +129,7 @@ func (d *DB) CreateWorkflow(workflowID, wfType string) error {
 // FOR UPDATE SKIP LOCKED ensures concurrent workers never claim the same row.
 // Without SKIP LOCKED, a second worker would block on the locked row, then
 // claim it after the first transaction commits — executing the workflow twice.
-func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]string, error) {
+func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]WorkflowRecord, error) {
 	const query = `
 		UPDATE workflows
 		SET
@@ -140,7 +146,7 @@ func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]string, error) {
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id
+		RETURNING id, workflow_type
 	`
 	rows, err := d.sqlDB.Query(query, limit, workerID)
 	if err != nil {
@@ -148,15 +154,15 @@ func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var ids []string
+	var records []WorkflowRecord
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan workflow id: %w", err)
+		var rec WorkflowRecord
+		if err := rows.Scan(&rec.ID, &rec.Type); err != nil {
+			return nil, fmt.Errorf("failed to scan workflow record: %w", err)
 		}
-		ids = append(ids, id)
+		records = append(records, rec)
 	}
-	return ids, rows.Err()
+	return records, rows.Err()
 }
 
 // UpdateWorkflowStatus transitions a workflow's aggregate status and clears the

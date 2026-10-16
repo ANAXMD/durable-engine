@@ -183,7 +183,12 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 		return fmt.Errorf("activity %s not registered: %w", name, err)
 	}
 
-	rawResult, err := actFn(context.Background(), idempotencyKey, input)
+	// Enforce activity timeout to prevent indefinite hangs if downstream services or APIs block.
+	const defaultActivityTimeout = 30 * time.Second
+	actCtx, actCancel := context.WithTimeout(context.Background(), defaultActivityTimeout)
+	defer actCancel()
+
+	rawResult, err := actFn(actCtx, idempotencyKey, input)
 	if err != nil {
 		return fmt.Errorf("activity %s failed: %w", name, err)
 	}

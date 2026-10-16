@@ -132,11 +132,11 @@ func newUUID() (string, error) {
 }
 
 func claimOrFatal(db *persistence.DB, workerID string) string {
-	ids, err := db.GetPendingWorkflows(1, workerID)
-	if err != nil || len(ids) == 0 {
-		log.Fatalf("FATAL: could not claim workflow: err=%v ids=%v", err, ids)
+	records, err := db.GetPendingWorkflows(1, workerID)
+	if err != nil || len(records) == 0 {
+		log.Fatalf("FATAL: could not claim workflow: err=%v records=%v", err, records)
 	}
-	return ids[0]
+	return records[0].ID
 }
 
 func assert(label string, pass bool) bool {
@@ -152,7 +152,10 @@ func assert(label string, pass bool) bool {
 
 func main() {
 	_ = context.Background() // satisfy import
-	dsn := "postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable"
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable"
+	}
 	allPassed := true
 
 	fmt.Println("\n╔══════════════════════════════════════════════════╗")
