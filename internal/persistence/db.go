@@ -10,8 +10,16 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// ErrRaceLost indicates that another worker already completed and recorded this activity step.
+// ErrRaceLost is returned by SaveEvent when the INSERT hit ON CONFLICT DO NOTHING,
+// meaning another worker already wrote an event for this (workflow, sequence, type) slot.
+// The caller should fetch the winner's event and adopt its output rather than failing.
 var ErrRaceLost = errors.New("event race condition lost")
+
+// ErrLeaseLost is returned by ExtendLease when the UPDATE matched 0 rows, proving
+// that another worker has already reclaimed the lease. Unlike a transient network
+// hiccup, 0 rows is definitive: the row exists but locked_by no longer matches us.
+// Callers must treat this as a hard stop and not retry.
+var ErrLeaseLost = errors.New("lease permanently lost")
 
 // DB wraps our sql connection so we can attach methods to it.
 type DB struct {
@@ -51,8 +59,11 @@ type Event struct {
 // The UNIQUE constraint on (workflow_id, sequence_number, event_type) added in migration 004
 // ensures append-only immutability. If an event insert is re-attempted (e.g. after a crash),
 // ON CONFLICT DO NOTHING makes the insert safely idempotent without updating existing records.
-// If RowsAffected is 0 and eventType is ACTIVITY_COMPLETED, ErrRaceLost is returned indicating
-// another worker already won the race to complete this activity step.
+//
+// If RowsAffected is 0 for any event type, ErrRaceLost is returned. This covers all
+// concurrent write scenarios: two workers racing to write SLEEP_START, SIDE_EFFECT, or
+// ACTIVITY_STARTED are all semantically identical races — the loser must adopt the winner's
+// persisted state rather than proceeding with its own locally-computed value.
 func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []byte, seqNum int) error {
 	const query = `
 		INSERT INTO workflow_events (workflow_id, event_type, event_name, input_data, output_data, sequence_number)
@@ -68,7 +79,7 @@ func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []
 	if err != nil {
 		return fmt.Errorf("failed to check rows affected: %w", err)
 	}
-	if rows == 0 && eventType == "ACTIVITY_COMPLETED" {
+	if rows == 0 {
 		return ErrRaceLost
 	}
 
@@ -128,15 +139,17 @@ type WorkflowRecord struct {
 }
 
 // GetPendingWorkflows atomically claims up to `limit` workable jobs and stamps
-// them with a lease owned by workerID. A job is claimable if it is:
+// them with a lease owned by workerID. A job is claimable when its run_at
+// timestamp has elapsed. run_at encodes the canonical scheduling time for each
+// status:
 //
-//   - PENDING                               — ready to run for the first time
-//   - RUNNING with an expired lease         — the previous worker crashed
-//   - SLEEPING with wake_at <= NOW()        — the durable timer has elapsed
+//   - PENDING  → run_at = created_at         (ready immediately)
+//   - SLEEPING → run_at = wake_at            (ready when durable timer fires)
+//   - RUNNING  → run_at = lease_expires_at   (reclaimable after lease lapses)
 //
-// Claiming sets status = 'RUNNING', locked_by = workerID, and
-// lease_expires_at = NOW() + 1 minute. ORDER BY created_at ASC, id ASC prevents starvation
-// (oldest jobs are always claimed first).
+// Claiming sets status = 'RUNNING', locked_by = workerID, run_at and
+// lease_expires_at = NOW() + 1 minute. ORDER BY run_at ASC, id ASC prevents
+// starvation (earliest-due jobs are always claimed first).
 //
 // FOR UPDATE SKIP LOCKED ensures concurrent workers never claim the same row.
 // Without SKIP LOCKED, a second worker would block on the locked row, then
@@ -147,14 +160,13 @@ func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]WorkflowRecord, 
 		SET
 			status           = 'RUNNING',
 			locked_by        = $2,
+			run_at           = NOW() + INTERVAL '1 minute',
 			lease_expires_at = NOW() + INTERVAL '1 minute'
 		WHERE id IN (
 			SELECT id FROM workflows
-			WHERE
-				status = 'PENDING'
-				OR (status = 'RUNNING'  AND lease_expires_at < NOW())
-				OR (status = 'SLEEPING' AND wake_at <= NOW())
-			ORDER BY created_at ASC, id ASC
+			WHERE status IN ('PENDING', 'RUNNING', 'SLEEPING')
+			  AND run_at <= NOW()
+			ORDER BY run_at ASC, id ASC
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
@@ -185,11 +197,15 @@ func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]WorkflowRecord, 
 // If the UPDATE affects 0 rows, the lease was lost; we return an error so the
 // caller knows the completion was not recorded.
 func (d *DB) UpdateWorkflowStatus(workflowID, status, workerID string) error {
+	// Null out run_at for terminal states: completed/failed workflows should
+	// never be reclaimed by the scheduler, and a NULL value keeps them out
+	// of the partial index entirely.
 	const query = `
 		UPDATE workflows
 		SET
 			status           = $1,
 			locked_by        = NULL,
+			run_at           = NULL,
 			lease_expires_at = NULL
 		WHERE id = $2
 		  AND locked_by = $3
@@ -212,8 +228,9 @@ func (d *DB) UpdateWorkflowStatus(workflowID, status, workerID string) error {
 }
 
 // SleepWorkflow transitions a workflow to SLEEPING state and records the
-// absolute time at which the engine should wake it (wake_at). It also clears
-// the lease so no worker holds an active claim on a sleeping workflow.
+// absolute time at which the engine should wake it (wake_at). It also sets
+// run_at = wakeAt so the scheduler can reclaim the workflow with a simple
+// run_at <= NOW() predicate, without needing a separate wake_at check.
 //
 // The workerID guard here prevents a zombie worker from accidentally sleeping
 // a workflow it no longer owns.
@@ -223,6 +240,7 @@ func (d *DB) SleepWorkflow(workflowID, workerID string, wakeAt time.Time) error 
 		SET
 			status           = 'SLEEPING',
 			wake_at          = $1,
+			run_at           = $1,
 			locked_by        = NULL,
 			lease_expires_at = NULL
 		WHERE id       = $2
@@ -245,12 +263,14 @@ func (d *DB) SleepWorkflow(workflowID, workerID string, wakeAt time.Time) error 
 }
 
 // ExpireLeaseForTest is a test-only helper that artificially sets a workflow's
-// lease_expires_at to the past, allowing the next poll to reclaim it without
-// waiting the full 1-minute TTL. Never call this in production code.
+// run_at and lease_expires_at to the past, allowing the next poll to reclaim
+// it without waiting the full 1-minute TTL. Never call this in production code.
 func (d *DB) ExpireLeaseForTest(workflowID string) error {
 	const query = `
 		UPDATE workflows
-		SET lease_expires_at = NOW() - INTERVAL '1 second'
+		SET
+			run_at           = NOW() - INTERVAL '1 second',
+			lease_expires_at = NOW() - INTERVAL '1 second'
 		WHERE id = $1
 	`
 	_, err := d.sqlDB.Exec(query, workflowID)
@@ -260,12 +280,17 @@ func (d *DB) ExpireLeaseForTest(workflowID string) error {
 	return nil
 }
 
-// ExtendLease extends the lease duration for an actively running workflow owned by workerID.
+// ExtendLease extends the lease duration for an actively running workflow owned
+// by workerID. Both run_at and lease_expires_at are kept in sync: run_at is
+// what the scheduler uses to decide reclaim eligibility, so it must advance
+// together with lease_expires_at.
 func (d *DB) ExtendLease(workflowID, workerID string, additional time.Duration) error {
 	intervalStr := fmt.Sprintf("%d seconds", int(additional.Seconds()))
 	const query = `
 		UPDATE workflows
-		SET lease_expires_at = NOW() + $3::interval
+		SET
+			run_at           = NOW() + $3::interval,
+			lease_expires_at = NOW() + $3::interval
 		WHERE id = $1 AND locked_by = $2
 	`
 	res, err := d.sqlDB.Exec(query, workflowID, workerID, intervalStr)
@@ -278,7 +303,10 @@ func (d *DB) ExtendLease(workflowID, workerID string, additional time.Duration) 
 		return fmt.Errorf("failed to check rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("lease lost for workflow %s", workflowID)
+		// 0 rows is definitive: the row exists but locked_by no longer matches us,
+		// meaning another worker has reclaimed the lease. Return the typed sentinel
+		// so callers can distinguish this hard stop from a transient DB error.
+		return ErrLeaseLost
 	}
 
 	return nil

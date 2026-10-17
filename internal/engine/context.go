@@ -202,14 +202,23 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 			case <-stopHeartbeat:
 				return
 			case <-ticker.C:
-				if c.workerID != "" {
-					if hbErr := c.db.ExtendLease(c.workflowID, c.workerID, 1*time.Minute); hbErr != nil {
-						log.Printf("⚠️  [HEARTBEAT] Failed to extend lease for %s: %v", c.workflowID, hbErr)
+				if c.workerID == "" {
+					continue
+				}
+				if hbErr := c.db.ExtendLease(c.workflowID, c.workerID, 1*time.Minute); hbErr != nil {
+					if errors.Is(hbErr, persistence.ErrLeaseLost) {
+						// Definitive: another worker now owns the lease.
+						// Cancel the activity context immediately so the
+						// activity stops running without a lease.
+						log.Printf("🔴 [HEARTBEAT] Lease permanently lost for %s — cancelling activity.", c.workflowID)
 						actCancel()
 						return
-					} else {
-						log.Printf("💓 [HEARTBEAT] Extended lease for workflow %s by 1m", c.workflowID)
 					}
+					// Transient error (e.g. network blip). Log and let the
+					// next tick retry — do NOT cancel the activity context.
+					log.Printf("⚠️  [HEARTBEAT] Transient error extending lease for %s: %v", c.workflowID, hbErr)
+				} else {
+					log.Printf("💓 [HEARTBEAT] Extended lease for workflow %s by 1m", c.workflowID)
 				}
 			}
 		}
@@ -253,6 +262,15 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 	}
 
 	if actErr != nil {
+		// If the activity context was cancelled by the heartbeat (lease lost), do NOT
+		// write an ACTIVITY_FAILED event. The lease is gone, so we almost certainly no
+		// longer own the workflow row. Writing a failure event here could corrupt a
+		// concurrently-running worker's state. Instead, return silently like a crash:
+		// the other worker (or the next reclaim cycle) will handle it cleanly.
+		if errors.Is(actCtx.Err(), context.Canceled) {
+			log.Printf("🔴 [FAILED] Activity %s abandoned — lease was lost mid-execution.", name)
+			return fmt.Errorf("activity %s abandoned: lease lost mid-execution: %w", name, actErr)
+		}
 		log.Printf("❌ [FAILED] Activity %s failed after %d retries: %v", name, len(backoffs), actErr)
 		errBytes, _ := json.Marshal(map[string]string{"error": actErr.Error()})
 		if saveErr := c.db.SaveEvent(c.workflowID, "ACTIVITY_FAILED", name, inputBytes, errBytes, c.sequenceNumber); saveErr != nil {
@@ -352,6 +370,24 @@ func (c *engineContext) Sleep(sleepName string, d time.Duration) error {
 
 	durationBytes, _ := json.Marshal(d.String())
 	if err := c.db.SaveEvent(c.workflowID, "SLEEP_START", sleepName, durationBytes, wakeBytes, c.sequenceNumber); err != nil {
+		if errors.Is(err, persistence.ErrRaceLost) {
+			// Another worker wrote SLEEP_START first. Adopt the winner's wake time
+			// so both workers yield to the same absolute timestamp.
+			log.Printf("⚠️  [RACE LOST] Sleep '%s' (Seq %d) already recorded by another worker. Adopting winner's wakeAt.", sleepName, c.sequenceNumber)
+			winnerEvent, getErr := c.db.GetEvent(c.workflowID, c.sequenceNumber)
+			if getErr != nil {
+				return fmt.Errorf("failed to fetch winner sleep event for '%s': %w", sleepName, getErr)
+			}
+			if winnerEvent == nil {
+				return fmt.Errorf("winner sleep event not found for '%s' (seq %d)", sleepName, c.sequenceNumber)
+			}
+			var winnerWakeAt time.Time
+			if unmarshalErr := json.Unmarshal(winnerEvent.OutputData, &winnerWakeAt); unmarshalErr != nil {
+				return fmt.Errorf("failed to unmarshal winner wakeAt for '%s': %w", sleepName, unmarshalErr)
+			}
+			log.Printf("💤 [SLEEP]    '%s' (Seq %d) — yielding until winner's time %s.", sleepName, c.sequenceNumber, winnerWakeAt.Format(time.RFC3339))
+			panic(YieldError{WakeAt: winnerWakeAt})
+		}
 		return fmt.Errorf("failed to save sleep event: %w", err)
 	}
 
@@ -393,6 +429,23 @@ func (c *engineContext) Now() (time.Time, error) {
 
 	timeBytes, _ := json.Marshal(currentTime)
 	if err := c.db.SaveEvent(c.workflowID, "SIDE_EFFECT", "TimeNow", []byte("{}"), timeBytes, c.sequenceNumber); err != nil {
+		if errors.Is(err, persistence.ErrRaceLost) {
+			// Another worker wrote the timestamp first. Adopt their value so that
+			// both workers return the same deterministic time for this sequence slot.
+			log.Printf("⚠️  [RACE LOST] Now() (Seq %d) already recorded by another worker. Adopting winner's timestamp.", c.sequenceNumber)
+			winnerEvent, getErr := c.db.GetEvent(c.workflowID, c.sequenceNumber)
+			if getErr != nil {
+				return time.Time{}, fmt.Errorf("failed to fetch winner Now() event: %w", getErr)
+			}
+			if winnerEvent == nil {
+				return time.Time{}, fmt.Errorf("winner Now() event not found (seq %d)", c.sequenceNumber)
+			}
+			var savedTime time.Time
+			if unmarshalErr := json.Unmarshal(winnerEvent.OutputData, &savedTime); unmarshalErr != nil {
+				return time.Time{}, fmt.Errorf("failed to unmarshal winner Now() timestamp: %w", unmarshalErr)
+			}
+			return savedTime, nil
+		}
 		return time.Time{}, fmt.Errorf("failed to save time to ledger: %w", err)
 	}
 
