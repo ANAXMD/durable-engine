@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_USER: engine_user
+          POSTGRES_PASSWORD: engine_password
+          POSTGRES_DB: durable_engine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.8" # Matches your go.mod requirement
+
+      - name: Run Database Migrations
+        env:
+          PGPASSWORD: engine_password
+        run: |
+          for file in migrations/*.sql; do
+            psql -h localhost -U engine_user -d durable_engine -f "$file"
+          done
+
+      - name: Check Formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Go code is not formatted. Run 'go fmt ./...'"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run Tests
+        env:
+          DATABASE_URL: postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable
+        run: go test -v -race ./...

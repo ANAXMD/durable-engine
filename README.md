@@ -1,10 +1,92 @@
 # Durable Execution Engine
 
-A lightweight, event-sourced durable workflow orchestrator written in Go and backed by PostgreSQL. The engine guarantees reliable, resumable workflow execution across worker crashes, network partitions, and process restarts.
+[![CI](https://github.com/ANAXMD/durable-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ANAXMD/durable-engine/actions/workflows/ci.yml)
+
+A fault-tolerant, highly concurrent durable execution engine built in Go and PostgreSQL. This engine guarantees that workflows run to completion despite network partitions, database timeouts, or violent worker crashes. 
+
+It handles distributed race conditions, memory divergence, and starvation natively, utilizing an append-only event sourcing ledger.
 
 ---
 
-## Architectural Guarantees & Correctness Invariants
+## 🚀 Chaos Testing & Demo
+
+The engine is built to survive catastrophic failure. You can verify this locally using the multi-process chaos harness. 
+
+Run `./scripts/chaos.sh` to boot 3 independent Go workers, inject 20 concurrent workflows, and violently terminate (`kill -9`) the workers mid-execution. The surviving workers will gracefully respect leases, wait for expiration, and adopt the orphaned workflows to ensure exactly-once side-effect completion (0 dropped, 0 double-charged).
+
+*(Add your recorded terminal GIF demo here)*
+
+---
+
+## 🛠️ Quick Start
+
+**Prerequisites:** Go 1.26.8+ and Docker.
+
+```bash
+# 1. Start the PostgreSQL database
+sudo docker compose up -d
+
+# 2. Run the database migrations
+for file in migrations/*.sql; do psql -h 127.0.0.1 -U engine_user -d durable_engine -f "$file"; done
+
+# 3. Start the worker (Defaults to PORT 8080)
+go run ./cmd/worker
+
+# 4. In a new terminal, trigger a workflow
+curl -X POST http://localhost:8080/workflows -d '{"type": "SendWelcomeEmail"}'
+```
+
+### In-Process Crash Simulation Harness
+You can also run the in-process execution simulation that demonstrates crash survival mid-workflow (during durable sleep) and verifies activity replay vs real executions:
+```bash
+go run ./cmd/simulation
+```
+
+---
+
+## ⚠️ Known Limitations (v1.0)
+To keep the initial architecture lean, several intentional tradeoffs were made:
+* **At-least-once execution:** The engine guarantees a step runs *at least* once. Activities must honor the provided idempotency key (e.g., Stripe API idempotency).
+* **Fencing Tokens:** Event writes are not yet fully fenced on lease ownership. The engine currently relies on `COMPLETED` priority logic to ignore stale appends.
+* **In-Memory Retries:** Retries are currently in-memory and not durable. Every error (including permanent failures like a declined card) is aggressively retried.
+* **Replay Performance:** Replay re-reads the entire workflow history. Extremely long workflows will degrade in replay speed. Future iterations will implement `continue-as-new` or state snapshots.
+* **No I/O:** Workflows currently take no input, and there are no signals, queries, or versioning.
+* **Security:** The HTTP API lacks authentication.
+
+---
+
+## 🏗️ Architecture Decision Records (ADRs)
+
+### 1. Why Postgres and `SKIP LOCKED`?
+Instead of adding a heavy distributed queue (like Kafka or RabbitMQ) and trying to synchronize it with database state, Postgres handles both. By using `FOR UPDATE SKIP LOCKED`, multiple Go workers can poll the `workflows` table concurrently without deadlocking or blocking each other. This turns Postgres into a highly scalable, starvation-free message broker.
+
+### 2. The Append-Only Ledger (Event Sourcing)
+Initially, workflows mutated a single state column. This caused race conditions where a slow worker could overwrite a successful completion. We migrated to an append-only ledger (`workflow_events`). Replaying the ledger ensures the in-memory state always matches reality. We enforce exact-once state via database constraints and a programmatic `ErrRaceLost` adoption pattern.
+
+### 3. Leases over Boot Sweeps
+Traditional background jobs use a "boot sweep" (a cron job that periodically checks for crashed tasks). This scales poorly. Instead, we use time-based leases. When a worker claims a job, it sets a lease expiration in the future. If a worker dies mid-charge, the lease naturally expires, and another worker claims it. Surviving workers extend their leases via background heartbeats.
+
+### 4. The `run_at` Optimization
+Polling originally checked three columns: `created_at` (for new jobs), `wake_at` (for sleeping jobs), and `lease_expires_at` (for crashed jobs). With 300,000 sleeping workflows, this forced Postgres to evaluate complex partial indexes, causing claim queries to take ~37ms. 
+**Fix:** Unified all scheduling into a single `run_at` column. The claim query is now a simple `WHERE status IN (...) AND run_at <= NOW()`. With a `(run_at, id)` index, claim latency dropped to **0.034ms**.
+
+---
+
+## 🐛 Bug Post-Mortem: The Crash Recovery Regression
+
+**The Problem:** 
+To prevent duplicate execution events, we updated `SaveEvent` to return `ErrRaceLost` if an insert affected 0 rows (meaning the event already existed). However, this broke crash recovery. 
+
+If Worker 1 wrote `ACTIVITY_STARTED` and crashed, Worker 2 would claim the workflow, replay the history, and re-execute. When Worker 2 tried to save `ACTIVITY_STARTED`, Postgres returned 0 rows. Worker 2 panicked with `ErrRaceLost` and permanently failed the workflow.
+
+**The Fix:**
+Changed `SaveEvent` to return `(inserted bool, err error)` and shifted the responsibility to the caller:
+* For `ACTIVITY_STARTED` and `ACTIVITY_FAILED`, `inserted == false` is treated as a harmless no-op (the step simply picks up where it left off). 
+* For `ACTIVITY_COMPLETED` and `SLEEP_START`, `inserted == false` indicates a true race condition. The worker catches this, fetches the winner's data from the database, and explicitly adopts the winner's value into its local memory to prevent state divergence.
+
+---
+
+## 🏛️ Architectural Guarantees & Correctness Invariants
 
 ### 1. Execution Semantics
 * **At-least-once activity execution, exactly-once effect with idempotent activities.**
@@ -19,16 +101,19 @@ A lightweight, event-sourced durable workflow orchestrator written in Go and bac
 * **Transient Activity Retries**: Activities automatically retry with exponential backoff on transient errors (waiting 2s, 4s, 8s across up to 3 retries). If all attempts are exhausted, an `ACTIVITY_FAILED` audit record is persisted before the workflow fails.
 
 ### 3. Distributed Concurrency & Zombie Recovery
-* **Atomic Claiming with Row-Level Locks**: Workers poll for workable jobs using PostgreSQL's pessimistic locking pattern:
+* **Atomic Claiming with Row-Level Locks & Single `run_at` Schedule**: Workers poll for workable jobs using PostgreSQL's pessimistic locking pattern:
   ```sql
   UPDATE workflows
-  SET status = 'RUNNING', locked_by = $2, lease_expires_at = NOW() + INTERVAL '1 minute'
+  SET
+      status           = 'RUNNING',
+      locked_by        = $2,
+      run_at           = NOW() + INTERVAL '1 minute',
+      lease_expires_at = NOW() + INTERVAL '1 minute'
   WHERE id IN (
       SELECT id FROM workflows
-      WHERE status = 'PENDING'
-         OR (status = 'RUNNING'  AND lease_expires_at < NOW())
-         OR (status = 'SLEEPING' AND wake_at <= NOW())
-      ORDER BY created_at ASC, id ASC
+      WHERE status IN ('PENDING', 'RUNNING', 'SLEEPING')
+        AND run_at <= NOW()
+      ORDER BY run_at ASC, id ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED
   )
@@ -41,31 +126,29 @@ A lightweight, event-sourced durable workflow orchestrator written in Go and bac
 ### 4. Durable Timers (Sleep)
 * Workflows can yield execution for arbitrary durations via `ctx.Sleep(name, duration)`.
 * On invocation, a `SLEEP_START` event is recorded with the absolute `wake_at` timestamp, and execution yields via structured control flow (`YieldError`).
-* The worker transitions the workflow row to `status = 'SLEEPING'` and releases the thread. No thread, socket, or in-memory timer is held. Polling workers automatically re-claim the workflow once `wake_at <= NOW()`.
+* The worker transitions the workflow row to `status = 'SLEEPING'`, sets `run_at = wake_at`, and releases the thread. No thread, socket, or in-memory timer is held. Polling workers automatically re-claim the workflow once `run_at <= NOW()`.
 
 ---
 
-## Database Schema & Migrations
+## 🗄️ Database Schema & Migrations
 
 The engine operates on two core tables in PostgreSQL:
 
-1. `workflows`: Tracks workflow instances, aggregate status (`PENDING`, `RUNNING`, `SLEEPING`, `COMPLETED`, `FAILED`), distributed lease locks (`locked_by`, `lease_expires_at`), and durable timers (`wake_at`).
-2. `workflow_events`: Append-only event ledger tracking execution events (`ACTIVITY_STARTED`, `ACTIVITY_COMPLETED`, `SLEEP_START`) with a unique constraint on `(workflow_id, sequence_number)`.
+1. `workflows`: Tracks workflow instances, aggregate status (`PENDING`, `RUNNING`, `SLEEPING`, `COMPLETED`, `FAILED`), distributed lease locks (`locked_by`, `lease_expires_at`), durable timers (`wake_at`), and unified scheduling (`run_at`).
+2. `workflow_events`: Append-only event ledger tracking execution events (`ACTIVITY_STARTED`, `ACTIVITY_COMPLETED`, `SLEEP_START`, `ACTIVITY_FAILED`) with a unique constraint on `(workflow_id, sequence_number, event_type)`.
 
 ### Migrations
 * `001_init.sql`: Base tables and workflow reference foreign keys.
 * `002_leases_and_timers.sql`: Distributed lease columns (`locked_by`, `lease_expires_at`, `wake_at`).
-* `003_claim_indexes.sql`: Partial index on claimable states (`PENDING`, `RUNNING`, `SLEEPING`) to prevent full table scans as historical rows grow:
-  ```sql
-  CREATE INDEX idx_workflows_claimable 
-  ON workflows (status, lease_expires_at, wake_at, id)
-  WHERE status IN ('PENDING', 'RUNNING', 'SLEEPING');
-  ```
-* `004_fix_ledger.sql`: Upgrades event ledger constraint to `UNIQUE (workflow_id, sequence_number, event_type)` for strict immutability, and ensures `created_at` timestamp.
+* `003_claim_indexes.sql`: Partial index on claimable states (`PENDING`, `RUNNING`, `SLEEPING`).
+* `004_fix_ledger.sql`: Upgrades event ledger constraint to `UNIQUE (workflow_id, sequence_number, event_type)` for immutability.
+* `005_fix_claim_index.sql`: Indexes claimable workflows with deterministic `(created_at, id)` ordering.
+* `006_run_at_optimization.sql`: Unifies scheduling columns (`created_at`, `wake_at`, `lease_expires_at`) into a single `run_at` column with `(run_at, id)` partial index.
+* `007_run_at_constraint.sql`: Enforces `CHECK (status IN ('COMPLETED', 'FAILED') OR run_at IS NOT NULL)` constraint for non-terminal workflows.
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 The engine respects standard environment variables:
 
@@ -73,39 +156,3 @@ The engine respects standard environment variables:
 | :--- | :--- | :--- |
 | `DATABASE_URL` | PostgreSQL connection string | `postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable` |
 | `PORT` | Worker HTTP trigger server port | `8080` |
-
----
-
-## Quickstart
-
-### 1. Start PostgreSQL
-```bash
-docker compose up -d
-```
-
-### 2. Apply Migrations
-Apply migrations in sequence using `psql` or your preferred migration tool:
-```bash
-psql "$DATABASE_URL" -f migrations/001_init.sql
-psql "$DATABASE_URL" -f migrations/002_leases_and_timers.sql
-psql "$DATABASE_URL" -f migrations/003_claim_indexes.sql
-psql "$DATABASE_URL" -f migrations/004_fix_ledger.sql
-```
-
-### 3. Run the Worker
-```bash
-go run ./cmd/worker
-```
-
-Trigger a new workflow via the HTTP API:
-```bash
-curl -X POST http://localhost:8080/workflows \
-  -H "Content-Type: application/json" \
-  -d '{"workflow_type": "MyOrderWorkflow"}'
-```
-
-### 4. Verify Resilience via Execution Simulation Harness
-The project includes an in-process execution simulation harness that demonstrates crash survival mid-workflow (during durable sleep) and verifies that completed activities are replayed rather than re-executed:
-```bash
-go run ./cmd/simulation
-```
