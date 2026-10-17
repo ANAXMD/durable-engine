@@ -225,7 +225,7 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 func processWorkflow(db *persistence.DB, reg *registry.Registry, wf persistence.WorkflowRecord, workerID string) {
 	fmt.Printf("\n🚀 Claimed Workflow: %s (Type: %s)\n", wf.ID, wf.Type)
 
-	runErr := engine.Run(wf.ID, wf.Type, reg, db)
+	runErr := engine.Run(wf.ID, wf.Type, reg, db, workerID)
 
 	var yieldErr engine.YieldError
 	switch {

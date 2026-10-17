@@ -1,16 +1,17 @@
-// cmd/chaos/main.go
+// cmd/simulation/main.go
 //
-// Chaos Test Harness for the Durable Engine.
+// Execution Simulation Harness for the Durable Engine.
 //
-// This script proves that the engine survives a catastrophic mid-execution crash
-// and correctly resumes a workflow from the exact point it stopped — without
-// re-running steps that already completed.
+// NOTE: This harness is an in-process Execution Simulation rather than a true
+// Chaos Test. It simulates mid-workflow crash-recovery and replay behavior
+// by closing database connections and expiring leases in-process, acknowledging
+// that it simulates skips and failures rather than issuing true cross-process SIGKILLs.
 //
-// Test Scenario:
+// Simulation Scenario:
 //
 //  1. Start a 3-step workflow:  FastStep1 → Sleep(3s) → FastStep2
 //  2. Let it yield on Sleep (FastStep1 is COMPLETED in the ledger)
-//  3. Simulate a crash: close the DB connection (worker 1 is dead)
+//  3. Simulate a crash: close the DB connection (simulating worker 1 death)
 //  4. Spin up a new worker (worker 2) with a fresh DB connection
 //  5. Artificially expire the DB lease for the workflow (bypass 1-min TTL)
 //  6. Worker 2 polls, finds the workflow, tries to run:
@@ -24,7 +25,7 @@
 //
 // Assert: FastStep1 executed exactly once. FastStep2 executed exactly once.
 //
-// Run: go run ./cmd/chaos
+// Run: go run ./cmd/simulation
 package main
 
 import (
@@ -98,7 +99,7 @@ func buildReg() *registry.Registry {
 // Returns (false, nil) if the workflow yielded, (true, nil) if COMPLETED,
 // or (false, err) on failure.
 func runEngine(db *persistence.DB, reg *registry.Registry, wfID, workerID string) (completed bool, err error) {
-	runErr := engine.Run(wfID, "ChaosWorkflow", reg, db)
+	runErr := engine.Run(wfID, "ChaosWorkflow", reg, db, workerID)
 
 	var yieldErr engine.YieldError
 	switch {
@@ -159,7 +160,7 @@ func main() {
 	allPassed := true
 
 	fmt.Println("\n╔══════════════════════════════════════════════════╗")
-	fmt.Println("║      DURABLE ENGINE — CHAOS TEST HARNESS         ║")
+	fmt.Println("║   DURABLE ENGINE — EXECUTION SIMULATION HARNESS  ║")
 	fmt.Println("╚══════════════════════════════════════════════════╝")
 
 	// ─── Phase 1: Setup ───────────────────────────────────────────────────────
@@ -189,7 +190,7 @@ func main() {
 	// We call engine.Run directly instead of the runEngine() helper.
 	// We intentionally DO NOT call db.SleepWorkflow() after it yields to simulate
 	// the worker dying the exact millisecond after appending to the event ledger.
-	runErr := engine.Run(wfID, "ChaosWorkflow", reg1, db1)
+	runErr := engine.Run(wfID, "ChaosWorkflow", reg1, db1, workerID1)
 	var yieldErr engine.YieldError
 	if !errors.As(runErr, &yieldErr) {
 		log.Fatalf("FAIL: expected a yield on first run, got err=%v", runErr)

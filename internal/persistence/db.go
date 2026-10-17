@@ -44,21 +44,15 @@ type Event struct {
 }
 
 // SaveEvent appends a new state change to the ledger.
-// The UNIQUE constraint on (workflow_id, sequence_number) added in migration 002
-// means a duplicate write (e.g. crash after save, retry on restart) will return
-// an error rather than silently double-writing — making this call idempotent-safe.
+// The UNIQUE constraint on (workflow_id, sequence_number, event_type) added in migration 004
+// ensures append-only immutability. If an event insert is re-attempted (e.g. after a crash),
+// ON CONFLICT DO NOTHING makes the insert safely idempotent without updating existing records.
 // Notice there is absolutely no UPDATE statement here — events are immutable.
 func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []byte, seqNum int) error {
-	// ON CONFLICT DO NOTHING makes this call idempotent. If we write an
-	// ACTIVITY_STARTED event, crash, and retry, the second INSERT is a no-op
-	// instead of an error. The UNIQUE constraint on (workflow_id, sequence_number)
-	// still protects against a different activity writing to the same slot.
 	const query = `
 		INSERT INTO workflow_events (workflow_id, event_type, event_name, input_data, output_data, sequence_number)
 		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (workflow_id, sequence_number) DO UPDATE
-		SET event_type = EXCLUDED.event_type,
-		    output_data = EXCLUDED.output_data
+		ON CONFLICT DO NOTHING
 	`
 	_, err := d.sqlDB.Exec(query, workflowID, eventType, eventName, input, output, seqNum)
 	if err != nil {
@@ -68,11 +62,15 @@ func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []
 }
 
 // GetEvent fetches a specific event by its sequence number for the Replay Core.
+// When multiple events share a sequence number (e.g. ACTIVITY_STARTED and ACTIVITY_COMPLETED),
+// ORDER BY id DESC ensures the latest lifecycle event is returned.
 func (d *DB) GetEvent(workflowID string, seqNum int) (*Event, error) {
 	const query = `
 		SELECT id, workflow_id, event_type, event_name, input_data, output_data, sequence_number
 		FROM workflow_events 
 		WHERE workflow_id = $1 AND sequence_number = $2
+		ORDER BY id DESC
+		LIMIT 1
 	`
 	row := d.sqlDB.QueryRow(query, workflowID, seqNum)
 
@@ -123,7 +121,7 @@ type WorkflowRecord struct {
 //   - SLEEPING with wake_at <= NOW()        — the durable timer has elapsed
 //
 // Claiming sets status = 'RUNNING', locked_by = workerID, and
-// lease_expires_at = NOW() + 1 minute. ORDER BY id prevents starvation
+// lease_expires_at = NOW() + 1 minute. ORDER BY created_at ASC, id ASC prevents starvation
 // (oldest jobs are always claimed first).
 //
 // FOR UPDATE SKIP LOCKED ensures concurrent workers never claim the same row.
@@ -142,7 +140,7 @@ func (d *DB) GetPendingWorkflows(limit int, workerID string) ([]WorkflowRecord, 
 				status = 'PENDING'
 				OR (status = 'RUNNING'  AND lease_expires_at < NOW())
 				OR (status = 'SLEEPING' AND wake_at <= NOW())
-			ORDER BY id
+			ORDER BY created_at ASC, id ASC
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
@@ -244,6 +242,21 @@ func (d *DB) ExpireLeaseForTest(workflowID string) error {
 	_, err := d.sqlDB.Exec(query, workflowID)
 	if err != nil {
 		return fmt.Errorf("failed to expire lease for test: %w", err)
+	}
+	return nil
+}
+
+// ExtendLease extends the lease duration for an actively running workflow owned by workerID.
+func (d *DB) ExtendLease(workflowID, workerID string, additional time.Duration) error {
+	intervalStr := fmt.Sprintf("%d seconds", int(additional.Seconds()))
+	const query = `
+		UPDATE workflows
+		SET lease_expires_at = NOW() + $3::interval
+		WHERE id = $1 AND locked_by = $2
+	`
+	_, err := d.sqlDB.Exec(query, workflowID, workerID, intervalStr)
+	if err != nil {
+		return fmt.Errorf("failed to extend lease: %w", err)
 	}
 	return nil
 }

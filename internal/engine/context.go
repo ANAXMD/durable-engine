@@ -48,6 +48,7 @@ func (y YieldError) Error() string {
 
 type engineContext struct {
 	workflowID     string
+	workerID       string
 	db             *persistence.DB
 	registry       *registry.Registry
 	sequenceNumber int
@@ -62,9 +63,14 @@ type engineContext struct {
 //
 // The workflow function is called via reflect so it can be registered by name
 // without the engine having a compile-time dependency on user code.
-func Run(wfID string, wfType string, reg *registry.Registry, db *persistence.DB) (err error) {
+func Run(wfID string, wfType string, reg *registry.Registry, db *persistence.DB, workerIDs ...string) (err error) {
+	var workerID string
+	if len(workerIDs) > 0 {
+		workerID = workerIDs[0]
+	}
 	ctx := &engineContext{
 		workflowID:     wfID,
+		workerID:       workerID,
 		db:             db,
 		registry:       reg,
 		sequenceNumber: 0,
@@ -183,14 +189,60 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 		return fmt.Errorf("activity %s not registered: %w", name, err)
 	}
 
-	// Enforce activity timeout to prevent indefinite hangs if downstream services or APIs block.
-	const defaultActivityTimeout = 30 * time.Second
-	actCtx, actCancel := context.WithTimeout(context.Background(), defaultActivityTimeout)
-	defer actCancel()
+	// Heartbeats: start a background goroutine to extend lease every 30s while executing.
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat)
 
-	rawResult, err := actFn(actCtx, idempotencyKey, input)
-	if err != nil {
-		return fmt.Errorf("activity %s failed: %w", name, err)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-ticker.C:
+				if c.workerID != "" {
+					if hbErr := c.db.ExtendLease(c.workflowID, c.workerID, 1*time.Minute); hbErr != nil {
+						log.Printf("⚠️  [HEARTBEAT] Failed to extend lease for %s: %v", c.workflowID, hbErr)
+					} else {
+						log.Printf("💓 [HEARTBEAT] Extended lease for workflow %s by 1m", c.workflowID)
+					}
+				}
+			}
+		}
+	}()
+
+	// Transient Activity Retries: exponential backoff retrying up to 3 times (wait 2s, 4s, 8s).
+	backoffs := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+	var rawResult any
+	var actErr error
+
+	const defaultActivityTimeout = 30 * time.Second
+
+	for attempt := 0; attempt <= len(backoffs); attempt++ {
+		if attempt > 0 {
+			waitTime := backoffs[attempt-1]
+			log.Printf("⚠️  [RETRY] Activity %s failed (attempt %d/%d): %v. Retrying in %v...", name, attempt, len(backoffs), actErr, waitTime)
+			time.Sleep(waitTime)
+		}
+
+		actCtx, actCancel := context.WithTimeout(context.Background(), defaultActivityTimeout)
+		rawResult, actErr = actFn(actCtx, idempotencyKey, input)
+		actCancel()
+
+		if actErr == nil {
+			break
+		}
+	}
+
+	if actErr != nil {
+		log.Printf("❌ [FAILED] Activity %s failed after %d retries: %v", name, len(backoffs), actErr)
+		errBytes, _ := json.Marshal(map[string]string{"error": actErr.Error()})
+		if saveErr := c.db.SaveEvent(c.workflowID, "ACTIVITY_FAILED", name, inputBytes, errBytes, c.sequenceNumber); saveErr != nil {
+			log.Printf("⚠️  Failed to save ACTIVITY_FAILED for %s: %v", name, saveErr)
+		}
+		return fmt.Errorf("activity %s failed after retries: %w", name, actErr)
 	}
 
 	// 4. Type-Safety Round-Trip: marshal → unmarshal into resultPtr.
@@ -236,6 +288,14 @@ func (c *engineContext) Sleep(sleepName string, d time.Duration) error {
 	}
 
 	if event != nil {
+		// Non-Determinism Detection: verify the history matches the code.
+		if event.EventType != "SLEEP_START" || event.EventName != sleepName {
+			return fmt.Errorf(
+				"non-deterministic execution detected at Seq %d: expected Sleep '%s', found '%s' ('%s')",
+				c.sequenceNumber, sleepName, event.EventName, event.EventType,
+			)
+		}
+
 		// The sleep was already saved — unmarshal the target wake time.
 		var wakeAt time.Time
 		if err := json.Unmarshal(event.OutputData, &wakeAt); err != nil {
@@ -282,6 +342,14 @@ func (c *engineContext) Now() (time.Time, error) {
 	}
 
 	if event != nil {
+		// Non-Determinism Detection: verify the history matches the code.
+		if event.EventType != "SIDE_EFFECT" || event.EventName != "TimeNow" {
+			return time.Time{}, fmt.Errorf(
+				"non-deterministic execution detected at Seq %d: expected side effect 'TimeNow', found '%s' ('%s')",
+				c.sequenceNumber, event.EventName, event.EventType,
+			)
+		}
+
 		log.Printf("⏪ [REPLAY]   Now() (Seq %d) — returning saved timestamp.", c.sequenceNumber)
 		var savedTime time.Time
 		if err := json.Unmarshal(event.OutputData, &savedTime); err != nil {

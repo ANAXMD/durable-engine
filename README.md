@@ -14,8 +14,9 @@ A lightweight, event-sourced durable workflow orchestrator written in Go and bac
 
 ### 2. Deterministic Replay & Guardrails
 * **Sequence-Based Event Sourcing**: During workflow execution, a sequence counter monotonically increments. For each step, if an event exists for the current sequence number, the stored output is deserialized directly into the target pointer without executing user code.
-* **Non-Determinism Detection**: During replay, the engine compares the registered event name in history against the activity currently invoked by code. If workflow definitions are modified out-of-order, the engine halts immediately with a non-determinism violation rather than corrupting workflow state.
-* **Activity Timeouts**: Activities are executed under a deadline-enforced context (`context.WithTimeout`) rather than unbounded background contexts, preventing downstream service hangs from starving worker threads.
+* **Non-Determinism Detection**: During replay, the engine compares the registered event name and event type in history against the code currently invoked. If workflow definitions are modified out-of-order, the engine halts immediately with a non-determinism violation rather than corrupting workflow state.
+* **Activity Timeouts & Heartbeats**: Activities are executed under a deadline-enforced context (`context.WithTimeout`). While an activity is actively running, a background goroutine issues heartbeats every 30 seconds via `ExtendLease`, extending the workflow's lease by 1 minute to prevent lease expiration during long-running tasks.
+* **Transient Activity Retries**: Activities automatically retry with exponential backoff on transient errors (waiting 2s, 4s, 8s across up to 3 retries). If all attempts are exhausted, an `ACTIVITY_FAILED` audit record is persisted before the workflow fails.
 
 ### 3. Distributed Concurrency & Zombie Recovery
 * **Atomic Claiming with Row-Level Locks**: Workers poll for workable jobs using PostgreSQL's pessimistic locking pattern:
@@ -27,7 +28,7 @@ A lightweight, event-sourced durable workflow orchestrator written in Go and bac
       WHERE status = 'PENDING'
          OR (status = 'RUNNING'  AND lease_expires_at < NOW())
          OR (status = 'SLEEPING' AND wake_at <= NOW())
-      ORDER BY id
+      ORDER BY created_at ASC, id ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED
   )
@@ -53,13 +54,14 @@ The engine operates on two core tables in PostgreSQL:
 
 ### Migrations
 * `001_init.sql`: Base tables and workflow reference foreign keys.
-* `002_leases_and_timers.sql`: Distributed lease columns (`locked_by`, `lease_expires_at`, `wake_at`) and sequence uniqueness constraint.
+* `002_leases_and_timers.sql`: Distributed lease columns (`locked_by`, `lease_expires_at`, `wake_at`).
 * `003_claim_indexes.sql`: Partial index on claimable states (`PENDING`, `RUNNING`, `SLEEPING`) to prevent full table scans as historical rows grow:
   ```sql
   CREATE INDEX idx_workflows_claimable 
   ON workflows (status, lease_expires_at, wake_at, id)
   WHERE status IN ('PENDING', 'RUNNING', 'SLEEPING');
   ```
+* `004_fix_ledger.sql`: Upgrades event ledger constraint to `UNIQUE (workflow_id, sequence_number, event_type)` for strict immutability, and ensures `created_at` timestamp.
 
 ---
 
@@ -87,6 +89,7 @@ Apply migrations in sequence using `psql` or your preferred migration tool:
 psql "$DATABASE_URL" -f migrations/001_init.sql
 psql "$DATABASE_URL" -f migrations/002_leases_and_timers.sql
 psql "$DATABASE_URL" -f migrations/003_claim_indexes.sql
+psql "$DATABASE_URL" -f migrations/004_fix_ledger.sql
 ```
 
 ### 3. Run the Worker
@@ -101,8 +104,8 @@ curl -X POST http://localhost:8080/workflows \
   -d '{"workflow_type": "MyOrderWorkflow"}'
 ```
 
-### 4. Verify Resilience via Chaos Harness
-The project includes a chaos test harness that demonstrates crash survival mid-workflow (during durable sleep) and verifies that completed activities are replayed rather than re-executed:
+### 4. Verify Resilience via Execution Simulation Harness
+The project includes an in-process execution simulation harness that demonstrates crash survival mid-workflow (during durable sleep) and verifies that completed activities are replayed rather than re-executed:
 ```bash
-go run ./cmd/chaos
+go run ./cmd/simulation
 ```
