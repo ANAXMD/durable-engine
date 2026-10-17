@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"reflect"
@@ -63,11 +64,7 @@ type engineContext struct {
 //
 // The workflow function is called via reflect so it can be registered by name
 // without the engine having a compile-time dependency on user code.
-func Run(wfID string, wfType string, reg *registry.Registry, db *persistence.DB, workerIDs ...string) (err error) {
-	var workerID string
-	if len(workerIDs) > 0 {
-		workerID = workerIDs[0]
-	}
+func Run(wfID string, wfType string, reg *registry.Registry, db *persistence.DB, workerID string) (err error) {
 	ctx := &engineContext{
 		workflowID:     wfID,
 		workerID:       workerID,
@@ -189,6 +186,9 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 		return fmt.Errorf("activity %s not registered: %w", name, err)
 	}
 
+	actCtx, actCancel := context.WithCancel(context.Background())
+	defer actCancel()
+
 	// Heartbeats: start a background goroutine to extend lease every 30s while executing.
 	stopHeartbeat := make(chan struct{})
 	defer close(stopHeartbeat)
@@ -205,6 +205,8 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 				if c.workerID != "" {
 					if hbErr := c.db.ExtendLease(c.workflowID, c.workerID, 1*time.Minute); hbErr != nil {
 						log.Printf("⚠️  [HEARTBEAT] Failed to extend lease for %s: %v", c.workflowID, hbErr)
+						actCancel()
+						return
 					} else {
 						log.Printf("💓 [HEARTBEAT] Extended lease for workflow %s by 1m", c.workflowID)
 					}
@@ -222,18 +224,32 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 
 	for attempt := 0; attempt <= len(backoffs); attempt++ {
 		if attempt > 0 {
+			if actCtx.Err() != nil {
+				break
+			}
 			waitTime := backoffs[attempt-1]
 			log.Printf("⚠️  [RETRY] Activity %s failed (attempt %d/%d): %v. Retrying in %v...", name, attempt, len(backoffs), actErr, waitTime)
-			time.Sleep(waitTime)
+			select {
+			case <-time.After(waitTime):
+			case <-actCtx.Done():
+				break
+			}
+		}
+		if actCtx.Err() != nil {
+			break
 		}
 
-		actCtx, actCancel := context.WithTimeout(context.Background(), defaultActivityTimeout)
-		rawResult, actErr = actFn(actCtx, idempotencyKey, input)
-		actCancel()
+		attemptCtx, attemptCancel := context.WithTimeout(actCtx, defaultActivityTimeout)
+		rawResult, actErr = actFn(attemptCtx, idempotencyKey, input)
+		attemptCancel()
 
 		if actErr == nil {
 			break
 		}
+	}
+
+	if actCtx.Err() != nil && actErr == nil {
+		actErr = actCtx.Err()
 	}
 
 	if actErr != nil {
@@ -245,21 +261,35 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 		return fmt.Errorf("activity %s failed after retries: %w", name, actErr)
 	}
 
-	// 4. Type-Safety Round-Trip: marshal → unmarshal into resultPtr.
-	// Ensures live execution and replay produce identically-typed values.
+	// 4. Type-Safety Round-Trip: serialize output and persist event.
 	outputBytes, err := json.Marshal(rawResult)
 	if err != nil {
 		return fmt.Errorf("failed to marshal output for %s: %w", name, err)
 	}
-	if err := json.Unmarshal(outputBytes, resultPtr); err != nil {
-		return fmt.Errorf("failed to unmarshal output into resultPtr for %s: %w", name, err)
-	}
 
 	// 5. Event Sourcing Phase: persist ACTIVITY_COMPLETED to the immutable ledger.
-	// ON CONFLICT DO NOTHING here means: if we somehow write COMPLETED twice
-	// (e.g., network timeout then retry), the second write is a harmless no-op.
+	// If another worker completed this step while we were running, SaveEvent returns ErrRaceLost.
+	// In that case, fetch the winner's output and do not use the loser's memory state.
 	if err := c.db.SaveEvent(c.workflowID, "ACTIVITY_COMPLETED", name, inputBytes, outputBytes, c.sequenceNumber); err != nil {
+		if errors.Is(err, persistence.ErrRaceLost) {
+			log.Printf("⚠️  [RACE LOST] Activity %s (Seq %d) was completed by another worker. Fetching winner's output...", name, c.sequenceNumber)
+			winnerEvent, getErr := c.db.GetEvent(c.workflowID, c.sequenceNumber)
+			if getErr != nil {
+				return fmt.Errorf("failed to fetch winner event after race lost for %s: %w", name, getErr)
+			}
+			if winnerEvent == nil {
+				return fmt.Errorf("winner event not found after race lost for %s (seq %d)", name, c.sequenceNumber)
+			}
+			if err := json.Unmarshal(winnerEvent.OutputData, resultPtr); err != nil {
+				return fmt.Errorf("failed to unmarshal winner output for %s: %w", name, err)
+			}
+			return nil
+		}
 		return fmt.Errorf("failed to save ACTIVITY_COMPLETED for %s: %w", name, err)
+	}
+
+	if err := json.Unmarshal(outputBytes, resultPtr); err != nil {
+		return fmt.Errorf("failed to unmarshal output into resultPtr for %s: %w", name, err)
 	}
 
 	return nil

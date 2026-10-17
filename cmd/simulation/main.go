@@ -155,7 +155,7 @@ func main() {
 	_ = context.Background() // satisfy import
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable"
+		dsn = "postgres://engine_user:engine_password@127.0.0.1:5432/durable_engine?sslmode=disable"
 	}
 	allPassed := true
 
@@ -174,7 +174,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("FATAL: %v", err)
 	}
-	workerID1 := fmt.Sprintf("chaos-w1-%d", os.Getpid())
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "simulation"
+	}
+	u1, err := newUUID()
+	if err != nil {
+		log.Fatalf("FATAL: %v", err)
+	}
+	workerID1 := fmt.Sprintf("%s-chaos-w1-%s", hostname, u1[:8])
 
 	if err := db1.CreateWorkflow(wfID, "ChaosWorkflow"); err != nil {
 		log.Fatalf("FATAL: %v", err)
@@ -213,7 +221,11 @@ func main() {
 		log.Fatalf("FATAL: worker 2 could not connect: %v", err)
 	}
 	defer db2.Close()
-	workerID2 := fmt.Sprintf("chaos-w2-%d", os.Getpid())
+	u2, err := newUUID()
+	if err != nil {
+		log.Fatalf("FATAL: %v", err)
+	}
+	workerID2 := fmt.Sprintf("%s-chaos-w2-%s", hostname, u2[:8])
 	reg2 := buildReg()
 	log.Printf("✅ Worker 2 connected (ID: %s)", workerID2)
 

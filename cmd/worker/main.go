@@ -85,7 +85,7 @@ func main() {
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable"
+		dsn = "postgres://engine_user:engine_password@127.0.0.1:5432/durable_engine?sslmode=disable"
 	}
 
 	db, err := persistence.ConnectDB(dsn)
@@ -171,7 +171,12 @@ const maxConcurrentWorkflows = 5
 func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persistence.DB, reg *registry.Registry) {
 	defer close(done)
 
-	workerID := fmt.Sprintf("worker-%d", os.Getpid())
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "worker"
+	}
+	u, _ := newUUID()
+	workerID := fmt.Sprintf("%s-%s", hostname, u[:8])
 	fmt.Printf("🔄 Worker loop running (ID: %s)...\n", workerID)
 
 	ticker := time.NewTicker(2 * time.Second)

@@ -3,11 +3,15 @@ package persistence
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	_ "github.com/lib/pq"
 )
+
+// ErrRaceLost indicates that another worker already completed and recorded this activity step.
+var ErrRaceLost = errors.New("event race condition lost")
 
 // DB wraps our sql connection so we can attach methods to it.
 type DB struct {
@@ -47,29 +51,39 @@ type Event struct {
 // The UNIQUE constraint on (workflow_id, sequence_number, event_type) added in migration 004
 // ensures append-only immutability. If an event insert is re-attempted (e.g. after a crash),
 // ON CONFLICT DO NOTHING makes the insert safely idempotent without updating existing records.
-// Notice there is absolutely no UPDATE statement here — events are immutable.
+// If RowsAffected is 0 and eventType is ACTIVITY_COMPLETED, ErrRaceLost is returned indicating
+// another worker already won the race to complete this activity step.
 func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []byte, seqNum int) error {
 	const query = `
 		INSERT INTO workflow_events (workflow_id, event_type, event_name, input_data, output_data, sequence_number)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT DO NOTHING
 	`
-	_, err := d.sqlDB.Exec(query, workflowID, eventType, eventName, input, output, seqNum)
+	res, err := d.sqlDB.Exec(query, workflowID, eventType, eventName, input, output, seqNum)
 	if err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 && eventType == "ACTIVITY_COMPLETED" {
+		return ErrRaceLost
+	}
+
 	return nil
 }
 
 // GetEvent fetches a specific event by its sequence number for the Replay Core.
-// When multiple events share a sequence number (e.g. ACTIVITY_STARTED and ACTIVITY_COMPLETED),
-// ORDER BY id DESC ensures the latest lifecycle event is returned.
+// When multiple events share a sequence number, ORDER BY (event_type = 'ACTIVITY_COMPLETED') DESC, id DESC
+// ensures a successful completion is prioritized over stale failed/started events.
 func (d *DB) GetEvent(workflowID string, seqNum int) (*Event, error) {
 	const query = `
 		SELECT id, workflow_id, event_type, event_name, input_data, output_data, sequence_number
 		FROM workflow_events 
 		WHERE workflow_id = $1 AND sequence_number = $2
-		ORDER BY id DESC
+		ORDER BY (event_type = 'ACTIVITY_COMPLETED') DESC, id DESC
 		LIMIT 1
 	`
 	row := d.sqlDB.QueryRow(query, workflowID, seqNum)
@@ -254,9 +268,18 @@ func (d *DB) ExtendLease(workflowID, workerID string, additional time.Duration) 
 		SET lease_expires_at = NOW() + $3::interval
 		WHERE id = $1 AND locked_by = $2
 	`
-	_, err := d.sqlDB.Exec(query, workflowID, workerID, intervalStr)
+	res, err := d.sqlDB.Exec(query, workflowID, workerID, intervalStr)
 	if err != nil {
 		return fmt.Errorf("failed to extend lease: %w", err)
 	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("lease lost for workflow %s", workflowID)
+	}
+
 	return nil
 }
