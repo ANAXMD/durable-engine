@@ -132,6 +132,21 @@ func newUUID() (string, error) {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }
 
+func expireLeaseForTest(db *persistence.DB, workflowID string) error {
+	const query = `
+		UPDATE workflows
+		SET
+			run_at           = NOW() - INTERVAL '1 second',
+			lease_expires_at = NOW() - INTERVAL '1 second'
+		WHERE id = $1
+	`
+	_, err := db.RawDB().Exec(query, workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to expire lease for test: %w", err)
+	}
+	return nil
+}
+
 func claimOrFatal(db *persistence.DB, workerID string) string {
 	records, err := db.GetPendingWorkflows(1, workerID)
 	if err != nil || len(records) == 0 {
@@ -231,7 +246,7 @@ func main() {
 
 	// ─── Phase 5: Expire the lease so the poll can reclaim ───────────────────
 	fmt.Println("\n━━━ Phase 5: Expiring lease (bypass 1-min TTL) ━━━")
-	if err := db2.ExpireLeaseForTest(wfID); err != nil {
+	if err := expireLeaseForTest(db2, wfID); err != nil {
 		log.Fatalf("FATAL: %v", err)
 	}
 	log.Printf("✅ Lease expired artificially")
@@ -262,7 +277,7 @@ func main() {
 	log.Printf("✅ Sleep should now be elapsed")
 
 	// Expire lease again to simulate the scheduler re-queuing the workflow.
-	if err := db2.ExpireLeaseForTest(wfID); err != nil {
+	if err := expireLeaseForTest(db2, wfID); err != nil {
 		log.Fatalf("FATAL: second lease expire: %v", err)
 	}
 

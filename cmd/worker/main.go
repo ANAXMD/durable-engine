@@ -68,6 +68,52 @@ func EmailActivity(ctx context.Context, idempotencyKey string, input any) (any, 
 	return "email_sent", nil
 }
 
+// ChaosWorkflow is a 3-step test workflow (Activity -> Sleep -> Activity) designed
+// for multi-process chaos testing. It writes actual side-effects to the effects table
+// keyed by the step's idempotency key.
+func ChaosWorkflow(ctx engine.WorkflowContext) error {
+	var step1Result string
+	if err := ctx.ExecuteActivity("ChaosStep1", "input-step1", &step1Result); err != nil {
+		return fmt.Errorf("ChaosStep1: %w", err)
+	}
+
+	if err := ctx.Sleep("chaos-sleep", 2*time.Second); err != nil {
+		return fmt.Errorf("chaos-sleep: %w", err)
+	}
+
+	var step2Result string
+	if err := ctx.ExecuteActivity("ChaosStep2", "input-step2", &step2Result); err != nil {
+		return fmt.Errorf("ChaosStep2: %w", err)
+	}
+
+	return nil
+}
+
+func makeChaosActivity(db *persistence.DB, activityName string, latency time.Duration) func(ctx context.Context, idempKey string, input any) (any, error) {
+	return func(ctx context.Context, idempKey string, input any) (any, error) {
+		// Record the side-effect to the effects table using idempotencyKey as the primary key
+		count, err := db.RecordEffect(idempKey, activityName, fmt.Sprintf("%v", input))
+		if err != nil {
+			return nil, fmt.Errorf("RecordEffect: %w", err)
+		}
+
+		if count > 1 {
+			fmt.Printf("   ⚠️  [DUPLICATE EXECUTION] %s (idempotency_key: %s, execution #%d)\n", activityName, idempKey, count)
+		} else {
+			fmt.Printf("   ⚡ [SIDE-EFFECT RECORDED] %s (idempotency_key: %s)\n", activityName, idempKey)
+		}
+
+		// Simulate external latency during which SIGKILL can strike
+		select {
+		case <-time.After(latency):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+		return fmt.Sprintf("result-%s", activityName), nil
+	}
+}
+
 // --- 2. MICROSERVICE SETUP ---
 
 func newUUID() (string, error) {
@@ -100,6 +146,11 @@ func main() {
 	reg.RegisterActivity("ChargeCreditCard", ChargeActivity)
 	reg.RegisterActivity("SendWelcomeEmail", EmailActivity)
 
+	// Register ChaosWorkflow and its side-effect recording activities
+	reg.RegisterWorkflow("ChaosWorkflow", ChaosWorkflow)
+	reg.RegisterActivity("ChaosStep1", makeChaosActivity(db, "ChaosStep1", 2500*time.Millisecond))
+	reg.RegisterActivity("ChaosStep2", makeChaosActivity(db, "ChaosStep2", 1000*time.Millisecond))
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -112,7 +163,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /workflows", makeCreateWorkflowHandler(db))
+	mux.HandleFunc("POST /workflows", makeCreateWorkflowHandler(db, reg))
 	server := &http.Server{Addr: ":" + port, Handler: mux}
 
 	go func() {
@@ -137,7 +188,7 @@ func main() {
 	fmt.Println("👋 All services stopped cleanly. Exiting.")
 }
 
-func makeCreateWorkflowHandler(db *persistence.DB) http.HandlerFunc {
+func makeCreateWorkflowHandler(db *persistence.DB, reg *registry.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := newUUID()
 		if err != nil {
@@ -147,14 +198,24 @@ func makeCreateWorkflowHandler(db *persistence.DB) http.HandlerFunc {
 
 		var req struct {
 			WorkflowType string `json:"workflow_type"`
+			Type         string `json:"type"`
 		}
-		// Allow caller to optionally specify workflow_type, defaulting to MyOrderWorkflow
+		// Allow caller to optionally specify workflow_type (or type), defaulting to MyOrderWorkflow
 		if r.Body != nil {
 			_ = json.NewDecoder(r.Body).Decode(&req)
 		}
 		wfType := req.WorkflowType
 		if wfType == "" {
+			wfType = req.Type
+		}
+		if wfType == "" {
 			wfType = "MyOrderWorkflow"
+		}
+
+		// Validate workflow_type exists in the registry
+		if _, err := reg.GetWorkflow(wfType); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"unknown workflow type: %s"}`, wfType), http.StatusBadRequest)
+			return
 		}
 
 		if err := db.CreateWorkflow(id, wfType); err != nil {
@@ -180,7 +241,10 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 	if err != nil {
 		hostname = "worker"
 	}
-	u, _ := newUUID()
+	u, err := newUUID()
+	if err != nil {
+		log.Fatalf("Fatal: failed to generate worker UUID: %v", err)
+	}
 	workerID := fmt.Sprintf("%s-%s", hostname, u[:8])
 	fmt.Printf("🔄 Worker loop running (ID: %s)...\n", workerID)
 

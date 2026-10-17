@@ -39,6 +39,59 @@ func (d *DB) Close() error {
 	return d.sqlDB.Close()
 }
 
+// NewDB wraps an existing *sql.DB into *DB. Useful for testing.
+func NewDB(db *sql.DB) *DB {
+	return &DB{sqlDB: db}
+}
+
+// RawDB returns the underlying *sql.DB instance. Useful for testing and inspection.
+func (d *DB) RawDB() *sql.DB {
+	return d.sqlDB
+}
+
+// GetWorkflowStatus returns the current status of the given workflow.
+func (d *DB) GetWorkflowStatus(workflowID string) (string, error) {
+	var status string
+	err := d.sqlDB.QueryRow("SELECT status FROM workflows WHERE id = $1", workflowID).Scan(&status)
+	if err != nil {
+		return "", fmt.Errorf("failed to get workflow status: %w", err)
+	}
+	return status, nil
+}
+
+// CountEvents returns the count of events for a workflow with a given event_type.
+func (d *DB) CountEvents(workflowID, eventType string) (int, error) {
+	var count int
+	err := d.sqlDB.QueryRow(
+		"SELECT COUNT(*) FROM workflow_events WHERE workflow_id = $1 AND event_type = $2",
+		workflowID, eventType,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count events: %w", err)
+	}
+	return count, nil
+}
+
+// RecordEffect inserts or updates an external side-effect in the effects table using the
+// idempotency_key as the primary key. If the key already exists (e.g. from an earlier attempt
+// before a worker crashed), it increments execution_count and returns the updated count.
+func (d *DB) RecordEffect(idempotencyKey, activityName, data string) (int, error) {
+	const query = `
+		INSERT INTO effects (idempotency_key, activity_name, data, execution_count, created_at, updated_at)
+		VALUES ($1, $2, $3, 1, NOW(), NOW())
+		ON CONFLICT (idempotency_key) DO UPDATE
+		SET execution_count = effects.execution_count + 1,
+		    updated_at = NOW()
+		RETURNING execution_count
+	`
+	var count int
+	err := d.sqlDB.QueryRow(query, idempotencyKey, activityName, data).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to record effect for key %s: %w", idempotencyKey, err)
+	}
+	return count, nil
+}
+
 // Event exactly matches the columns in our migrations/001_init.sql schema.
 type Event struct {
 	ID             int
@@ -251,24 +304,6 @@ func (d *DB) SleepWorkflow(workflowID, workerID string, wakeAt time.Time) error 
 		return fmt.Errorf("lease lost for workflow %s before sleep could be recorded", workflowID)
 	}
 
-	return nil
-}
-
-// ExpireLeaseForTest is a test-only helper that artificially sets a workflow's
-// run_at and lease_expires_at to the past, allowing the next poll to reclaim
-// it without waiting the full 1-minute TTL. Never call this in production code.
-func (d *DB) ExpireLeaseForTest(workflowID string) error {
-	const query = `
-		UPDATE workflows
-		SET
-			run_at           = NOW() - INTERVAL '1 second',
-			lease_expires_at = NOW() - INTERVAL '1 second'
-		WHERE id = $1
-	`
-	_, err := d.sqlDB.Exec(query, workflowID)
-	if err != nil {
-		return fmt.Errorf("failed to expire lease for test: %w", err)
-	}
 	return nil
 }
 
