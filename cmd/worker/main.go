@@ -106,12 +106,17 @@ func main() {
 	shutdown := make(chan struct{})
 	done := make(chan struct{})
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /workflows", makeCreateWorkflowHandler(db))
-	server := &http.Server{Addr: ":8080", Handler: mux}
+	server := &http.Server{Addr: ":" + port, Handler: mux}
 
 	go func() {
-		fmt.Println("🌐 HTTP API listening on :8080")
+		fmt.Printf("🌐 HTTP API listening on :%s\n", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Fatal: HTTP server error: %v", err)
 		}

@@ -29,5 +29,5 @@ DROP INDEX IF EXISTS idx_workflows_claimable_ordered;
 -- 4. Create the new, unified partial index.
 --    Covers only claimable rows; terminal rows (COMPLETED, FAILED) are excluded.
 --    Ordering by (run_at, id) exactly matches the new ORDER BY clause so the
---    planner can satisfy the query with an index-only scan.
+--    planner can satisfy the query with an index scan.
 CREATE INDEX idx_workflows_run_at ON workflows (run_at, id) WHERE status IN ('PENDING', 'RUNNING', 'SLEEPING');

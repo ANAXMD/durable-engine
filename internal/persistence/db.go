@@ -10,11 +10,6 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// ErrRaceLost is returned by SaveEvent when the INSERT hit ON CONFLICT DO NOTHING,
-// meaning another worker already wrote an event for this (workflow, sequence, type) slot.
-// The caller should fetch the winner's event and adopt its output rather than failing.
-var ErrRaceLost = errors.New("event race condition lost")
-
 // ErrLeaseLost is returned by ExtendLease when the UPDATE matched 0 rows, proving
 // that another worker has already reclaimed the lease. Unlike a transient network
 // hiccup, 0 rows is definitive: the row exists but locked_by no longer matches us.
@@ -60,30 +55,27 @@ type Event struct {
 // ensures append-only immutability. If an event insert is re-attempted (e.g. after a crash),
 // ON CONFLICT DO NOTHING makes the insert safely idempotent without updating existing records.
 //
-// If RowsAffected is 0 for any event type, ErrRaceLost is returned. This covers all
-// concurrent write scenarios: two workers racing to write SLEEP_START, SIDE_EFFECT, or
-// ACTIVITY_STARTED are all semantically identical races — the loser must adopt the winner's
-// persisted state rather than proceeding with its own locally-computed value.
-func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []byte, seqNum int) error {
+// inserted is true when the row was freshly written, false when ON CONFLICT suppressed it
+// (meaning another worker or a previous retry already holds this slot). Callers are
+// responsible for interpreting false — most event types can simply ignore it (idempotent
+// no-op), while ACTIVITY_COMPLETED must fetch and adopt the winner's stored output.
+func (d *DB) SaveEvent(workflowID, eventType, eventName string, input, output []byte, seqNum int) (inserted bool, err error) {
 	const query = `
 		INSERT INTO workflow_events (workflow_id, event_type, event_name, input_data, output_data, sequence_number)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT DO NOTHING
 	`
-	res, err := d.sqlDB.Exec(query, workflowID, eventType, eventName, input, output, seqNum)
-	if err != nil {
-		return fmt.Errorf("failed to save event: %w", err)
+	res, execErr := d.sqlDB.Exec(query, workflowID, eventType, eventName, input, output, seqNum)
+	if execErr != nil {
+		return false, fmt.Errorf("failed to save event: %w", execErr)
 	}
 
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to check rows affected: %w", err)
-	}
-	if rows == 0 {
-		return ErrRaceLost
+	rows, execErr := res.RowsAffected()
+	if execErr != nil {
+		return false, fmt.Errorf("failed to check rows affected: %w", execErr)
 	}
 
-	return nil
+	return rows > 0, nil
 }
 
 // GetEvent fetches a specific event by its sequence number for the Replay Core.
@@ -307,6 +299,35 @@ func (d *DB) ExtendLease(workflowID, workerID string, additional time.Duration) 
 		// meaning another worker has reclaimed the lease. Return the typed sentinel
 		// so callers can distinguish this hard stop from a transient DB error.
 		return ErrLeaseLost
+	}
+
+	return nil
+}
+
+// RetryWorkflow requeues a FAILED workflow by resetting it to PENDING so the
+// next polling cycle can reclaim it. The WHERE status = 'FAILED' guard ensures
+// we only retry genuinely terminal workflows and never interrupt a live RUNNING
+// or SLEEPING workflow whose lease is currently held by an active worker.
+func (d *DB) RetryWorkflow(workflowID string) error {
+	const query = `
+		UPDATE workflows
+		SET
+			status = 'PENDING',
+			run_at = NOW()
+		WHERE id = $1
+		  AND status = 'FAILED'
+	`
+	result, err := d.sqlDB.Exec(query, workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to retry workflow %s: %w", workflowID, err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected for retry: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("workflow %s is not in FAILED state (cannot retry)", workflowID)
 	}
 
 	return nil
