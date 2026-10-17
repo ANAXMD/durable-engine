@@ -12,7 +12,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:latest
+        image: postgres:15
         env:
           POSTGRES_USER: engine_user
           POSTGRES_PASSWORD: engine_password
@@ -39,7 +39,7 @@ jobs:
           PGPASSWORD: engine_password
         run: |
           for file in migrations/*.sql; do
-            psql -h localhost -U engine_user -d durable_engine -f "$file"
+            psql -v ON_ERROR_STOP=1 -h localhost -U engine_user -d durable_engine -f "$file"
           done
 
       - name: Check Formatting

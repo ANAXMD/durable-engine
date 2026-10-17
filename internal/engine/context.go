@@ -13,6 +13,10 @@ import (
 	"durable-engine/internal/registry"
 )
 
+// heartbeatInterval controls how often in-flight activities extend their lease.
+// It defaults to 20 seconds, but can be adjusted in tests for rapid verification.
+var heartbeatInterval = 20 * time.Second
+
 // WorkflowContext is the interface injected into every workflow function.
 // Using resultPtr any (instead of a generic) keeps the interface compatible
 // with reflection-based dispatch while still enabling type-safe result binding.
@@ -196,7 +200,7 @@ func (c *engineContext) ExecuteActivity(name string, input any, resultPtr any) e
 	go func() {
 		// Tick at 20s — well within the 60s lease — to provide two heartbeat
 		// opportunities before the lease would naturally expire.
-		ticker := time.NewTicker(20 * time.Second)
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 
 		for {
