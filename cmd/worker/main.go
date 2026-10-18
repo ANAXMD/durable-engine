@@ -275,9 +275,10 @@ func runWorkerLoop(shutdown <-chan struct{}, done chan<- struct{}, db *persisten
 				continue
 			}
 			if len(workflows) == 0 {
-				fmt.Println("🔍 Polling for workflows...")
 				continue
 			}
+
+			fmt.Printf("🔍 Found %d workflow(s)\n", len(workflows))
 
 			for _, wf := range workflows {
 				sem <- struct{}{}

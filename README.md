@@ -61,7 +61,7 @@ for file in migrations/*.sql; do PGPASSWORD=engine_password psql -h 127.0.0.1 -U
 go test -v -race ./...
 ```
 
-The test suite requires an accessible PostgreSQL database configured via `DATABASE_URL` with all migrations applied. See [TestRecoveryFromStartedStep](file:///home/ana/durable-engine/internal/engine/engine_test.go#L44) for an example of validating crash recovery and race condition handling during event replay.
+The test suite requires an accessible PostgreSQL database configured via `DATABASE_URL` with all migrations applied. See [TestRecoveryFromStartedStep](internal/engine/engine_test.go#L44) for an example of validating crash recovery and race condition handling during event replay.
 
 ---
 
@@ -86,7 +86,7 @@ Instead of adding a heavy distributed queue (like Kafka or RabbitMQ) and trying 
 
 ### 2. The Append-Only Ledger (Event Sourcing)
 
-The ledger was always event-sourced, but the initial upsert logic mistakenly overwrote completions. Replaying the ledger ensures the in-memory state always matches reality. We enforce at-least-once execution via database constraints and a programmatic adoption pattern.
+The ledger was always event-sourced, but the initial upsert logic mistakenly overwrote completions. Replaying the ledger ensures the in-memory state always matches reality. The constraints keep the ledger unique, and the at-least-once guarantee comes from lease reclaim plus replay.
 
 ### 3. Leases over Boot Sweeps
 
@@ -94,8 +94,8 @@ Traditional background jobs use a "boot sweep" (a cron job that periodically che
 
 ### 4. The `run_at` Optimization
 
-Polling originally checked three columns: `created_at` (for new jobs), `wake_at` (for sleeping jobs), and `lease_expires_at` (for crashed jobs). With 300,000 sleeping workflows, this forced Postgres to evaluate complex partial indexes, causing claim queries to take ~37ms.
-**Fix:** Unified all scheduling into a single `run_at` column. The claim query is now a simple `WHERE status IN (...) AND run_at <= NOW()`. With a `(run_at, id)` index, claim latency dropped to **0.375ms** (benchmarkable via `scripts/benchmark.sql` with 300,000 sleeping workflows).
+Polling originally checked three columns: `created_at` (for new jobs), `wake_at` (for sleeping jobs), and `lease_expires_at` (for crashed jobs). With 300,000 sleeping workflows, this forced Postgres to evaluate complex partial indexes, causing claim queries to take ~85ms.
+**Fix:** Unified all scheduling into a single `run_at` column. The claim query is now a simple `WHERE status IN (...) AND run_at <= NOW()`. With a `(run_at, id)` index, claim latency dropped to **0.354ms** (benchmarkable via `scripts/benchmark.sql` with 300,000 sleeping workflows). 0.354ms is the execution time for the full claim UPDATE, whereas our legacy three-way-OR query took 85.030ms.
 
 ---
 

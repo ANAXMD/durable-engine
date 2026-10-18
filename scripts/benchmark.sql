@@ -1,8 +1,8 @@
 -- Benchmark script: Measures claim query performance with 300,000 sleeping workflows.
 --
 -- Inserts 300,000 dummy workflows with status 'SLEEPING' and run_at in the future,
--- plus a batch of claimable workflows. Then runs EXPLAIN ANALYZE on the SKIP LOCKED
--- claim query to measure local index scan latency.
+-- plus a batch of claimable workflows. Then runs EXPLAIN ANALYZE on both the legacy
+-- three-way-OR query and the optimized run_at claim query to compare latency.
 
 BEGIN;
 
@@ -30,7 +30,28 @@ FROM generate_series(1, 5);
 \echo 'Analyzing table statistics...'
 ANALYZE workflows;
 
-\echo 'Running EXPLAIN ANALYZE on SKIP LOCKED claim query...'
+\echo 'Running EXPLAIN ANALYZE on legacy three-way-OR claim query (for comparison)...'
+SAVEPOINT legacy_bench;
+EXPLAIN ANALYZE
+UPDATE workflows
+SET
+    status           = 'RUNNING',
+    locked_by        = 'bench-worker',
+    lease_expires_at = NOW() + INTERVAL '1 minute'
+WHERE id IN (
+    SELECT id FROM workflows
+    WHERE
+        status = 'PENDING'
+        OR (status = 'RUNNING'  AND lease_expires_at < NOW())
+        OR (status = 'SLEEPING' AND wake_at <= NOW())
+    ORDER BY created_at ASC, id ASC
+    LIMIT 5
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, workflow_type;
+ROLLBACK TO SAVEPOINT legacy_bench;
+
+\echo 'Running EXPLAIN ANALYZE on optimized run_at claim query...'
 EXPLAIN ANALYZE
 UPDATE workflows
 SET
