@@ -1,6 +1,6 @@
 # Durable Execution Engine
 
-[![CI](https://github.com/ANAXMD/durable-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ANAXMD/durable-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/ANAXMD/durable-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ANAXMD/durable-engine/actions/workflows/ci.yml)
 
 A fault-tolerant, highly concurrent durable execution engine built in Go and PostgreSQL. This engine guarantees that workflows run to completion despite network partitions, database timeouts, or forceful worker crashes.
 
