@@ -189,3 +189,5 @@ The engine respects standard environment variables:
 | :------------- | :------------------------------ | :------------------------------------------------------------------------------------- |
 | `DATABASE_URL` | PostgreSQL connection string    | `postgres://engine_user:engine_password@localhost:5432/durable_engine?sslmode=disable` |
 | `PORT`         | Worker HTTP trigger server port | `8080`                                                                                 |
+
+*See also: [raft-lab](https://github.com/ANAXMD/raft-lab), a Raft consensus visualizer built on a deterministic simulator.*
